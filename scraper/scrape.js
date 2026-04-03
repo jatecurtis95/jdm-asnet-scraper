@@ -6,8 +6,6 @@ const ASNET_USER = process.env.ASNET_USERNAME
 const ASNET_PASS = process.env.ASNET_PASSWORD
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY
-const TEST_MODE = process.argv.includes('--test')
-const MAX_PAGES_PER_MAKE = TEST_MODE ? 1 : 200
 
 // Make names in both English and Japanese for matching
 const MAKES = [
@@ -22,6 +20,17 @@ const MAKES = [
   { en: 'LEXUS', jp: 'レクサス' },
   { en: 'ISUZU', jp: 'いすゞ' },
 ]
+
+// Year ranges for splitting high-volume makes (Toyota, Nissan, Honda)
+// Each chunk is searched separately to avoid exceeding pagination limits
+const YEAR_RANGES = [
+  { from: 1990, to: 2005 },
+  { from: 2006, to: 2015 },
+  { from: 2016, to: 2020 },
+  { from: 2021, to: 2030 },
+]
+// Makes that need year-range splitting due to high result counts (4000+)
+const HIGH_VOLUME_MAKES = ['TOYOTA', 'NISSAN', 'HONDA']
 
 if (!ASNET_USER || !ASNET_PASS) {
   console.error('Missing ASNET_USERNAME or ASNET_PASSWORD env vars')
@@ -71,21 +80,37 @@ function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`)
 }
 
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms))
+}
+
 // ─── Main scraper ────────────────────────────────────────────────────────────
 async function main() {
-  log('Starting ASNET scraper v10...')
-  log(`Mode: ${TEST_MODE ? 'TEST (1 page per make)' : 'FULL'}`)
+  log('Starting ASNET scraper v11...')
+  log('Mode: FULL (all pages, year-range splitting for high-volume makes)')
 
   const browser = await puppeteer.launch({
     headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-web-security',
+      '--disable-features=VizDisplayCompositor',
+    ],
   })
 
   const page = await browser.newPage()
   await page.setViewport({ width: 1280, height: 900 })
 
+  // Emulate a real browser to avoid headless detection issues with image loading
+  await page.setUserAgent(
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+  )
+
   // Set longer timeout for slow ASNET pages
-  page.setDefaultNavigationTimeout(30000)
+  page.setDefaultNavigationTimeout(60000)
   page.setDefaultTimeout(15000)
 
   try {
@@ -158,7 +183,6 @@ async function main() {
         await inputs[1].type(ASNET_PASS, { delay: 30 })
         log('Typed via Puppeteer fallback')
       } else if (inputs.length === 1) {
-        // Might only have password visible, user might be separate
         await inputs[0].click({ clickCount: 3 })
         await inputs[0].type(ASNET_USER, { delay: 30 })
         log(`Only found ${inputs.length} visible input`)
@@ -305,7 +329,7 @@ async function main() {
         return null
       }),
     ])
-    await new Promise(r => setTimeout(r, 3000))
+    await sleep(3000)
     log(`  Search tab loaded: ${page.url()}`)
     await page.waitForSelector('select', { timeout: 10000 }).catch(() => {})
 
@@ -332,364 +356,22 @@ async function main() {
 
     for (let m = 0; m < MAKES.length; m++) {
       const make = MAKES[m]
-      log(`\n[${m + 1}/${MAKES.length}] Scraping ${make.en}...`)
+      const needsSplit = HIGH_VOLUME_MAKES.includes(make.en)
+      const ranges = needsSplit ? YEAR_RANGES : [null] // null = no year filter
 
-      try {
-        // Navigate to AA Bid search page
-        await page.goto('https://www.asnet.jp/asnet/search/search?initmode=201', {
-          waitUntil: 'networkidle2',
-          timeout: 60000,
-        })
-        await page.waitForSelector('select[name="MultiForm[0].MakerCode"]', { timeout: 10000 })
+      log(`\n[${m + 1}/${MAKES.length}] Scraping ${make.en}${needsSplit ? ` (split into ${ranges.length} year ranges)` : ''}...`)
 
-        // Find the option value for this make
-        const optValue = await page.evaluate((makeEn, makeJp) => {
-          const sel = document.querySelector('select[name="MultiForm[0].MakerCode"]')
-          if (!sel) return null
-          for (const opt of sel.options) {
-            const text = opt.textContent.trim().toUpperCase()
-            if (text.includes(makeEn) || text.includes(makeJp)) return opt.value
-          }
-          return null
-        }, make.en, make.jp)
+      for (const yearRange of ranges) {
+        const rangeLabel = yearRange ? `${yearRange.from}-${yearRange.to}` : 'all years'
+        if (yearRange) log(`  Year range: ${rangeLabel}`)
 
-        if (!optValue) {
-          log(`  Could not find ${make.en} in dropdown, skipping`)
-          continue
+        try {
+          const makeTotal = await scrapeMakeRange(page, make, yearRange)
+          grandTotal += makeTotal
+          log(`  ${make.en} [${rangeLabel}] complete: ${makeTotal} vehicles synced`)
+        } catch (e) {
+          log(`  Error scraping ${make.en} [${rangeLabel}]: ${e.message}`)
         }
-
-        // Set value and submit form directly (bypasses the 0台 counter issue)
-        const navPromise = page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => 'timeout')
-        await page.evaluate((val) => {
-          const sel = document.querySelector('select[name="MultiForm[0].MakerCode"]')
-          sel.value = val
-          sel.closest('form').submit()
-        }, optValue)
-        await navPromise
-        log(`  Selected ${make.en} (value=${optValue}), results: ${page.url()}`)
-
-        log(`  Results URL: ${page.url()}`)
-
-        // Wait for results table
-        await page.waitForSelector('table tr td', { timeout: 15000 }).catch(() => {})
-
-        // Check if we're on a results page
-        const resultsCheck = await page.evaluate(() => {
-          const text = document.body.textContent
-          const rows = document.querySelectorAll('table tr').length
-          // Check for "units found" or Japanese equivalents
-          const unitsMatch = text.match(/([\d,]+)\s*(units?\s*found|件|台)/i)
-          return {
-            url: window.location.href,
-            rows,
-            units: unitsMatch ? unitsMatch[1].replace(/,/g, '') : '0',
-            hasResults: rows > 5 && (text.includes('Lot No') || text.includes('TOYOTA') || text.includes('NISSAN') || text.includes('HONDA') || text.includes('トヨタ')),
-            snippet: text.replace(/\s+/g, ' ').substring(0, 300),
-          }
-        })
-        log(`  ${resultsCheck.rows} rows, ${resultsCheck.units} units, hasResults: ${resultsCheck.hasResults}`)
-        if (!resultsCheck.hasResults) {
-          log(`  Page content: ${resultsCheck.snippet.substring(0, 200)}`)
-        }
-
-        // Get total count — try both English and Japanese patterns
-        const totalText = await page.evaluate(() => {
-          const bodyText = document.body.textContent
-          // English: "4,001 units found"
-          let match = bodyText.match(/([\d,]+)\s*units?\s*found/i)
-          if (match) return match[1].replace(/,/g, '')
-          // Japanese: "4,001 件" or "4,001台"
-          match = bodyText.match(/([\d,]+)\s*件/)
-          if (match) return match[1].replace(/,/g, '')
-          match = bodyText.match(/([\d,]+)\s*台/)
-          if (match) return match[1].replace(/,/g, '')
-          return '0'
-        })
-        const totalCount = parseInt(totalText)
-        log(`  Found ${totalCount} ${make.en} vehicles`)
-
-        if (totalCount === 0) continue
-
-        // ─── Paginate and scrape ─────────────────────────────────────
-        let pageNum = 1
-        let makeTotal = 0
-
-        while (pageNum <= MAX_PAGES_PER_MAKE) {
-          // Scrape current page
-          const vehicles = await page.evaluate(() => {
-            // Map header columns
-            const colMap = {}
-            const allRows = document.querySelectorAll('table tr')
-            for (const row of allRows) {
-              const cells = row.querySelectorAll('th, td')
-              const rowText = row.textContent
-              if (rowText.includes('Lot No') && (rowText.includes('Make') || rowText.includes('Car Name'))) {
-                cells.forEach((cell, i) => {
-                  const t = cell.textContent.replace(/\s+/g, ' ').trim().toLowerCase()
-                  if (t.includes('picture')) colMap.picture = i
-                  else if (t.includes('corner') || t.includes('location')) colMap.location = i
-                  else if (t.includes('lot')) colMap.lotNo = i
-                  else if (t.includes('year')) colMap.year = i
-                  else if (t.includes('make') || t.includes('car name')) colMap.makeModel = i
-                  else if (t.includes('model') || t.includes('engine')) colMap.modelEngine = i
-                  else if (t.includes('inspection') || t.includes('mileage')) colMap.inspMileage = i
-                  else if (t.includes('exterior') || t.includes('color')) colMap.color = i
-                  else if (t.includes('gear')) colMap.gear = i
-                  else if (t.includes('score')) colMap.score = i
-                  else if (t.includes('start') || t.includes('wholesale') || t.includes('price')) colMap.price = i
-                })
-                break
-              }
-            }
-            if (!colMap.lotNo) return []
-
-            const vehicles = []
-            for (const row of allRows) {
-              const cells = row.querySelectorAll('td')
-              if (cells.length < 8) continue
-              const getText = (cell) => cell ? cell.textContent.replace(/\s+/g, ' ').trim() : ''
-              const getLines = (cell) => {
-                if (!cell) return []
-                const html = cell.innerHTML.replace(/<br\s*\/?>/gi, '\n').replace(/<\/div>/gi, '\n')
-                const temp = document.createElement('div')
-                temp.innerHTML = html
-                return (temp.textContent || '').split('\n').map(l => l.trim()).filter(Boolean)
-              }
-
-              const lotText = getText(cells[colMap.lotNo])
-              const lotMatch = lotText.match(/(\d{2,6})/)
-              if (!lotMatch) continue
-              const lotNumber = lotMatch[1]
-
-              const yearText = getText(cells[colMap.year])
-              const makeLines = getLines(cells[colMap.makeModel]).filter(l => !l.includes('translated') && !l.includes('Google'))
-              const modelLines = getLines(cells[colMap.modelEngine])
-              const inspLines = getLines(cells[colMap.inspMileage])
-              const color = getText(cells[colMap.color]) || null
-              const gearLines = getLines(cells[colMap.gear])
-              const scoreText = colMap.score !== undefined ? getText(cells[colMap.score]).trim() : null
-              const priceText = colMap.price !== undefined ? getText(cells[colMap.price]).replace(/[^\d,]/g, '') : null
-              const locLines = getLines(cells[colMap.location])
-
-              // Image
-              let imageUrl = null
-              if (colMap.picture !== undefined) {
-                const img = cells[colMap.picture].querySelector('img')
-                if (img?.src && img.src.includes('asnet')) imageUrl = img.src
-              }
-
-              // Auction house
-              let auctionHouse = null
-              for (const line of locLines) {
-                if (/(USS|HAA|TAA|JU |CAA|LAA|AUCNET|ZIP|BCN|ARAI)/i.test(line)) {
-                  auctionHouse = line
-                  break
-                }
-              }
-              if (!auctionHouse) {
-                for (const line of locLines) {
-                  if (!/AA-Bid|AS-One|Real-Bid|Negotiable|New/i.test(line) && line.length > 1) auctionHouse = line
-                }
-              }
-
-              // Listing type
-              let listingType = 'AA-Bid'
-              const locText = getText(cells[colMap.location])
-              if (locText.includes('AS-One Price')) listingType = 'AS-One Price'
-              else if (locText.includes('AA-One Price')) listingType = 'AA-One Price'
-
-              // Transmission
-              let transmission = null, ac = null
-              if (gearLines.length >= 1) {
-                const g = gearLines[0].trim().toUpperCase()
-                if (['FAT', 'AT', 'DAT', 'MT', 'CVT', 'CA'].includes(g) || /^F\d$/.test(g)) transmission = g
-              }
-              if (gearLines.length >= 2) {
-                const a = gearLines[1].trim().toUpperCase()
-                if (['AAC', 'WAC', 'AC'].includes(a)) ac = a
-              }
-
-              // Inspection / mileage
-              let inspection = null, mileage = null
-              for (const line of inspLines) {
-                if (/[RH]\d+\/\d+/i.test(line) && !inspection) {
-                  const m = line.match(/[RH]\d+\/\d+/i)
-                  if (m) inspection = m[0]
-                }
-                if (/\d+K?\s*km/i.test(line) && mileage === null) {
-                  const cleaned = line.replace(/[,\s]/g, '').toUpperCase()
-                  const km = cleaned.match(/([\d.]+)K/i)
-                  mileage = km ? Math.round(parseFloat(km[1]) * 1000) : parseInt(cleaned) || null
-                }
-              }
-
-              const houseShort = (auctionHouse || 'UNK').replace(/[^A-Za-z0-9]/g, '').substring(0, 8)
-              const make = (makeLines[0] || '').charAt(0).toUpperCase() + (makeLines[0] || '').slice(1).toLowerCase()
-              const modelCode = (modelLines[0] || '').trim()
-              let engineCc = null
-              const engMatch = (modelLines[1] || modelLines[0] || '').match(/(\d{3,5})/)
-              if (engMatch) engineCc = parseInt(engMatch[1])
-
-              vehicles.push({
-                stock_number: `ASNET-${lotNumber}-${houseShort}`,
-                lot_number: lotNumber,
-                make,
-                model: makeLines[1] || 'Unknown',
-                variant: makeLines[2] || null,
-                model_code: modelCode || null,
-                year_raw: yearText,
-                mileage_km: mileage,
-                transmission,
-                engine_cc: engineCc,
-                exterior_color: color,
-                score: (/^[SABR\d]/.test(scoreText || '') && (scoreText || '').length <= 3) ? scoreText : null,
-                auction_house: auctionHouse,
-                start_price_jpy_raw: priceText,
-                air_conditioning: ac,
-                inspection_expiry: inspection,
-                listing_type: listingType,
-                image_url: imageUrl,
-              })
-            }
-            return vehicles
-          })
-
-          if (!vehicles.length) break
-
-          // Process and upsert
-          const records = vehicles
-            .map(v => ({
-              stock_number: v.stock_number,
-              lot_number: v.lot_number,
-              make: v.make,
-              model: v.model,
-              variant: v.variant,
-              model_code: v.model_code,
-              year: parseJapaneseYear(v.year_raw),
-              mileage_km: v.mileage_km,
-              transmission: v.transmission,
-              engine_cc: v.engine_cc,
-              exterior_color: v.exterior_color,
-              score: v.score,
-              auction_house: v.auction_house,
-              start_price_jpy: parsePrice(v.start_price_jpy_raw),
-              air_conditioning: v.air_conditioning,
-              inspection_expiry: v.inspection_expiry,
-              status: 'upcoming',
-              listing_type: v.listing_type,
-              source: 'asnet',
-              images: v.image_url ? [v.image_url] : [],
-            }))
-            .filter(r => r.year && r.make)
-
-          // Deduplicate by stock_number (same lot can appear twice in a page)
-          const seen = new Set()
-          const uniqueRecords = records.filter(r => {
-            if (seen.has(r.stock_number)) return false
-            seen.add(r.stock_number)
-            return true
-          })
-
-          if (uniqueRecords.length) {
-            const { error } = await supabase
-              .from('auction_vehicles')
-              .upsert(uniqueRecords, { onConflict: 'stock_number' })
-
-            if (error) {
-              log(`  Page ${pageNum}: upsert error: ${error.message}`)
-            } else {
-              makeTotal += uniqueRecords.length
-              log(`  Page ${pageNum}: ${records.length} vehicles synced`)
-            }
-          }
-
-          // ─── Enrich with detail images (click popup, capture DOM images) ──
-          const detailLinks = await page.$$('a.showDetail')
-          let enrichedCount = 0
-
-          // Set up AJAX response capture for detail endpoint
-          let lastDetailHtml = null
-          const detailResponseHandler = async (response) => {
-            if (response.url().includes('/detail/detail')) {
-              lastDetailHtml = await response.text().catch(() => null)
-            }
-          }
-          page.on('response', detailResponseHandler)
-
-          for (let d = 0; d < detailLinks.length && d < uniqueRecords.length; d++) {
-            try {
-              lastDetailHtml = null
-              const links = await page.$$('a.showDetail')
-              if (d >= links.length) break
-
-              await links[d].click()
-
-              // Wait for the detail AJAX response (max 8 seconds)
-              let waited = 0
-              while (!lastDetailHtml && waited < 8000) {
-                await new Promise(r => setTimeout(r, 500))
-                waited += 500
-              }
-
-              if (lastDetailHtml) {
-                // Decode HTML entities (&amp; -> &) before parsing URLs
-                const decodedHtml = lastDetailHtml.replace(/&amp;/g, '&')
-                // Parse image URLs from the AJAX HTML response
-                const allImgUrls = [...new Set(
-                  [...decodedHtml.matchAll(/(https?:\/\/imga\.asnet2\.com\/ImgGet[^"'\s<>]+)/gi)].map(m => m[1])
-                )]
-
-                if (allImgUrls.length > 0) {
-                  const photos = allImgUrls.filter(u => !u.match(/v5=1\d{2}/))
-                  const sheets = allImgUrls.filter(u => u.match(/v5=1\d{2}/))
-
-                  const updateData = { images: photos.length > 0 ? photos : allImgUrls }
-                  if (sheets.length > 0) updateData.auction_sheet_url = sheets[0]
-
-                  await supabase.from('auction_vehicles').update(updateData).eq('stock_number', uniqueRecords[d].stock_number)
-                  enrichedCount++
-                }
-              }
-
-              // Close popup
-              await page.evaluate(() => {
-                const closeBtn = document.querySelector('.ui-dialog-titlebar-close, .close, [title="Close"], button.close, a.close, span.close')
-                if (closeBtn) closeBtn.click()
-                else document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }))
-              })
-              await new Promise(r => setTimeout(r, 500))
-            } catch (e) {
-              // Non-critical, continue
-            }
-
-            if ((d + 1) % 10 === 0) log(`    Enriched ${d + 1}/${detailLinks.length} (${enrichedCount} with images)...`)
-          }
-
-          page.off('response', detailResponseHandler)
-          log(`  Page ${pageNum}: enriched ${enrichedCount}/${detailLinks.length} with full images + auction sheets`)
-
-          // Go to next page
-          const hasNext = await page.evaluate(() => {
-            const links = document.querySelectorAll('a')
-            for (const link of links) {
-              if (link.textContent.trim().includes('Next')) {
-                link.click()
-                return true
-              }
-            }
-            return false
-          })
-
-          if (!hasNext) break
-          pageNum++
-          await page.waitForTimeout(3000)
-        }
-
-        grandTotal += makeTotal
-        log(`  ${make.en} complete: ${makeTotal} vehicles synced`)
-
-      } catch (e) {
-        log(`  Error scraping ${make.en}: ${e.message}`)
       }
     }
 
@@ -702,6 +384,458 @@ async function main() {
   } finally {
     await browser.close()
   }
+}
+
+// ─── Scrape a single make (optionally filtered by year range) ────────────────
+async function scrapeMakeRange(page, make, yearRange) {
+  // Navigate to AA Bid search page
+  await page.goto('https://www.asnet.jp/asnet/search/search?initmode=201', {
+    waitUntil: 'networkidle2',
+    timeout: 60000,
+  })
+  await page.waitForSelector('select[name="MultiForm[0].MakerCode"]', { timeout: 10000 })
+
+  // Find the option value for this make
+  const optValue = await page.evaluate((makeEn, makeJp) => {
+    const sel = document.querySelector('select[name="MultiForm[0].MakerCode"]')
+    if (!sel) return null
+    for (const opt of sel.options) {
+      const text = opt.textContent.trim().toUpperCase()
+      if (text.includes(makeEn) || text.includes(makeJp)) return opt.value
+    }
+    return null
+  }, make.en, make.jp)
+
+  if (!optValue) {
+    log(`  Could not find ${make.en} in dropdown, skipping`)
+    return 0
+  }
+
+  // Set make value, and optionally set year range dropdowns, then submit
+  const navPromise = page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => 'timeout')
+  await page.evaluate((val, yearRange) => {
+    const sel = document.querySelector('select[name="MultiForm[0].MakerCode"]')
+    sel.value = val
+
+    // Set year range if provided
+    if (yearRange) {
+      // Try common year dropdown selectors used on ASNET search forms
+      const yearFromNames = [
+        'MultiForm[0].YearFrom', 'MultiForm[0].NenFrom', 'MultiForm[0].yearFrom',
+        'yearFrom', 'NenFrom', 'year_from',
+      ]
+      const yearToNames = [
+        'MultiForm[0].YearTo', 'MultiForm[0].NenTo', 'MultiForm[0].yearTo',
+        'yearTo', 'NenTo', 'year_to',
+      ]
+
+      // Find and set year-from dropdown
+      for (const name of yearFromNames) {
+        const fromSel = document.querySelector(`select[name="${name}"]`)
+        if (fromSel) {
+          // Find closest matching option value
+          for (const opt of fromSel.options) {
+            const optVal = parseInt(opt.value)
+            const optText = parseInt(opt.textContent)
+            if (optVal === yearRange.from || optText === yearRange.from) {
+              fromSel.value = opt.value
+              break
+            }
+          }
+          break
+        }
+      }
+
+      // Find and set year-to dropdown
+      for (const name of yearToNames) {
+        const toSel = document.querySelector(`select[name="${name}"]`)
+        if (toSel) {
+          for (const opt of toSel.options) {
+            const optVal = parseInt(opt.value)
+            const optText = parseInt(opt.textContent)
+            if (optVal === yearRange.to || optText === yearRange.to) {
+              toSel.value = opt.value
+              break
+            }
+          }
+          break
+        }
+      }
+
+      // Also try Japanese-era year selects — look for any select near "年式" label
+      const allSelects = document.querySelectorAll('select')
+      for (const s of allSelects) {
+        const nameL = (s.name || '').toLowerCase()
+        if (nameL.includes('nen') || nameL.includes('year')) {
+          // Log for debugging — these will be in the year dropdown area
+          console.log(`Found year-related select: ${s.name}, options: ${s.options.length}`)
+        }
+      }
+    }
+
+    sel.closest('form').submit()
+  }, optValue, yearRange)
+  await navPromise
+  log(`  Selected ${make.en} (value=${optValue})${yearRange ? ` years ${yearRange.from}-${yearRange.to}` : ''}, results: ${page.url()}`)
+
+  // Wait for results table
+  await page.waitForSelector('table tr td', { timeout: 15000 }).catch(() => {})
+
+  // Check if we're on a results page
+  const resultsCheck = await page.evaluate(() => {
+    const text = document.body.textContent
+    const rows = document.querySelectorAll('table tr').length
+    const unitsMatch = text.match(/([\d,]+)\s*(units?\s*found|件|台)/i)
+    return {
+      url: window.location.href,
+      rows,
+      units: unitsMatch ? unitsMatch[1].replace(/,/g, '') : '0',
+      hasResults: rows > 5 && (text.includes('Lot No') || text.includes('TOYOTA') || text.includes('NISSAN') || text.includes('HONDA') || text.includes('トヨタ')),
+      snippet: text.replace(/\s+/g, ' ').substring(0, 300),
+    }
+  })
+  log(`  ${resultsCheck.rows} rows, ${resultsCheck.units} units, hasResults: ${resultsCheck.hasResults}`)
+  if (!resultsCheck.hasResults) {
+    log(`  Page content: ${resultsCheck.snippet.substring(0, 200)}`)
+  }
+
+  // Get total count — try both English and Japanese patterns
+  const totalText = await page.evaluate(() => {
+    const bodyText = document.body.textContent
+    let match = bodyText.match(/([\d,]+)\s*units?\s*found/i)
+    if (match) return match[1].replace(/,/g, '')
+    match = bodyText.match(/([\d,]+)\s*件/)
+    if (match) return match[1].replace(/,/g, '')
+    match = bodyText.match(/([\d,]+)\s*台/)
+    if (match) return match[1].replace(/,/g, '')
+    return '0'
+  })
+  const totalCount = parseInt(totalText)
+  log(`  Found ${totalCount} ${make.en} vehicles`)
+
+  if (totalCount === 0) return 0
+
+  // ─── Paginate and scrape ─────────────────────────────────────
+  let pageNum = 1
+  let makeTotal = 0
+
+  while (true) {
+    // Scrape current page
+    const vehicles = await page.evaluate(() => {
+      // Map header columns
+      const colMap = {}
+      const allRows = document.querySelectorAll('table tr')
+      for (const row of allRows) {
+        const cells = row.querySelectorAll('th, td')
+        const rowText = row.textContent
+        if (rowText.includes('Lot No') && (rowText.includes('Make') || rowText.includes('Car Name'))) {
+          cells.forEach((cell, i) => {
+            const t = cell.textContent.replace(/\s+/g, ' ').trim().toLowerCase()
+            if (t.includes('picture')) colMap.picture = i
+            else if (t.includes('corner') || t.includes('location')) colMap.location = i
+            else if (t.includes('lot')) colMap.lotNo = i
+            else if (t.includes('year')) colMap.year = i
+            else if (t.includes('make') || t.includes('car name')) colMap.makeModel = i
+            else if (t.includes('model') || t.includes('engine')) colMap.modelEngine = i
+            else if (t.includes('inspection') || t.includes('mileage')) colMap.inspMileage = i
+            else if (t.includes('exterior') || t.includes('color')) colMap.color = i
+            else if (t.includes('gear')) colMap.gear = i
+            else if (t.includes('score')) colMap.score = i
+            else if (t.includes('start') || t.includes('wholesale') || t.includes('price')) colMap.price = i
+          })
+          break
+        }
+      }
+      if (!colMap.lotNo) return []
+
+      const vehicles = []
+      for (const row of allRows) {
+        const cells = row.querySelectorAll('td')
+        if (cells.length < 8) continue
+        const getText = (cell) => cell ? cell.textContent.replace(/\s+/g, ' ').trim() : ''
+        const getLines = (cell) => {
+          if (!cell) return []
+          const html = cell.innerHTML.replace(/<br\s*\/?>/gi, '\n').replace(/<\/div>/gi, '\n')
+          const temp = document.createElement('div')
+          temp.innerHTML = html
+          return (temp.textContent || '').split('\n').map(l => l.trim()).filter(Boolean)
+        }
+
+        const lotText = getText(cells[colMap.lotNo])
+        const lotMatch = lotText.match(/(\d{2,6})/)
+        if (!lotMatch) continue
+        const lotNumber = lotMatch[1]
+
+        const yearText = getText(cells[colMap.year])
+        const makeLines = getLines(cells[colMap.makeModel]).filter(l => !l.includes('translated') && !l.includes('Google'))
+        const modelLines = getLines(cells[colMap.modelEngine])
+        const inspLines = getLines(cells[colMap.inspMileage])
+        const color = getText(cells[colMap.color]) || null
+        const gearLines = getLines(cells[colMap.gear])
+        const scoreText = colMap.score !== undefined ? getText(cells[colMap.score]).trim() : null
+        const priceText = colMap.price !== undefined ? getText(cells[colMap.price]).replace(/[^\d,]/g, '') : null
+        const locLines = getLines(cells[colMap.location])
+
+        // Image
+        let imageUrl = null
+        if (colMap.picture !== undefined) {
+          const img = cells[colMap.picture].querySelector('img')
+          if (img?.src && img.src.includes('asnet')) imageUrl = img.src
+        }
+
+        // Auction house
+        let auctionHouse = null
+        for (const line of locLines) {
+          if (/(USS|HAA|TAA|JU |CAA|LAA|AUCNET|ZIP|BCN|ARAI)/i.test(line)) {
+            auctionHouse = line
+            break
+          }
+        }
+        if (!auctionHouse) {
+          for (const line of locLines) {
+            if (!/AA-Bid|AS-One|Real-Bid|Negotiable|New/i.test(line) && line.length > 1) auctionHouse = line
+          }
+        }
+
+        // Listing type
+        let listingType = 'AA-Bid'
+        const locText = getText(cells[colMap.location])
+        if (locText.includes('AS-One Price')) listingType = 'AS-One Price'
+        else if (locText.includes('AA-One Price')) listingType = 'AA-One Price'
+
+        // Transmission
+        let transmission = null, ac = null
+        if (gearLines.length >= 1) {
+          const g = gearLines[0].trim().toUpperCase()
+          if (['FAT', 'AT', 'DAT', 'MT', 'CVT', 'CA'].includes(g) || /^F\d$/.test(g)) transmission = g
+        }
+        if (gearLines.length >= 2) {
+          const a = gearLines[1].trim().toUpperCase()
+          if (['AAC', 'WAC', 'AC'].includes(a)) ac = a
+        }
+
+        // Inspection / mileage
+        let inspection = null, mileage = null
+        for (const line of inspLines) {
+          if (/[RH]\d+\/\d+/i.test(line) && !inspection) {
+            const m = line.match(/[RH]\d+\/\d+/i)
+            if (m) inspection = m[0]
+          }
+          if (/\d+K?\s*km/i.test(line) && mileage === null) {
+            const cleaned = line.replace(/[,\s]/g, '').toUpperCase()
+            const km = cleaned.match(/([\d.]+)K/i)
+            mileage = km ? Math.round(parseFloat(km[1]) * 1000) : parseInt(cleaned) || null
+          }
+        }
+
+        const houseShort = (auctionHouse || 'UNK').replace(/[^A-Za-z0-9]/g, '').substring(0, 8)
+        const make = (makeLines[0] || '').charAt(0).toUpperCase() + (makeLines[0] || '').slice(1).toLowerCase()
+        const modelCode = (modelLines[0] || '').trim()
+        let engineCc = null
+        const engMatch = (modelLines[1] || modelLines[0] || '').match(/(\d{3,5})/)
+        if (engMatch) engineCc = parseInt(engMatch[1])
+
+        vehicles.push({
+          stock_number: `ASNET-${lotNumber}-${houseShort}`,
+          lot_number: lotNumber,
+          make,
+          model: makeLines[1] || 'Unknown',
+          variant: makeLines[2] || null,
+          model_code: modelCode || null,
+          year_raw: yearText,
+          mileage_km: mileage,
+          transmission,
+          engine_cc: engineCc,
+          exterior_color: color,
+          score: (/^[SABR\d]/.test(scoreText || '') && (scoreText || '').length <= 3) ? scoreText : null,
+          auction_house: auctionHouse,
+          start_price_jpy_raw: priceText,
+          air_conditioning: ac,
+          inspection_expiry: inspection,
+          listing_type: listingType,
+          image_url: imageUrl,
+        })
+      }
+      return vehicles
+    })
+
+    if (!vehicles.length) break
+
+    // Process and upsert
+    const records = vehicles
+      .map(v => ({
+        stock_number: v.stock_number,
+        lot_number: v.lot_number,
+        make: v.make,
+        model: v.model,
+        variant: v.variant,
+        model_code: v.model_code,
+        year: parseJapaneseYear(v.year_raw),
+        mileage_km: v.mileage_km,
+        transmission: v.transmission,
+        engine_cc: v.engine_cc,
+        exterior_color: v.exterior_color,
+        score: v.score,
+        auction_house: v.auction_house,
+        start_price_jpy: parsePrice(v.start_price_jpy_raw),
+        air_conditioning: v.air_conditioning,
+        inspection_expiry: v.inspection_expiry,
+        status: 'upcoming',
+        listing_type: v.listing_type,
+        source: 'asnet',
+        images: v.image_url ? [v.image_url] : [],
+      }))
+      .filter(r => r.year && r.make)
+
+    // Deduplicate by stock_number (same lot can appear twice in a page)
+    const seen = new Set()
+    const uniqueRecords = records.filter(r => {
+      if (seen.has(r.stock_number)) return false
+      seen.add(r.stock_number)
+      return true
+    })
+
+    if (uniqueRecords.length) {
+      const { error } = await supabase
+        .from('auction_vehicles')
+        .upsert(uniqueRecords, { onConflict: 'stock_number' })
+
+      if (error) {
+        log(`  Page ${pageNum}: upsert error: ${error.message}`)
+      } else {
+        makeTotal += uniqueRecords.length
+        log(`  Page ${pageNum}: ${records.length} vehicles synced`)
+      }
+    }
+
+    // ─── Enrich with detail images (click popup, capture AJAX images) ──
+    await enrichPageWithImages(page, uniqueRecords, pageNum)
+
+    // Go to next page
+    const hasNext = await page.evaluate(() => {
+      const links = document.querySelectorAll('a')
+      for (const link of links) {
+        if (link.textContent.trim().includes('Next')) {
+          link.click()
+          return true
+        }
+      }
+      return false
+    })
+
+    if (!hasNext) break
+    pageNum++
+    await sleep(3000)
+  }
+
+  return makeTotal
+}
+
+// ─── Image enrichment — click detail popups and capture AJAX image URLs ──────
+async function enrichPageWithImages(page, uniqueRecords, pageNum) {
+  const detailLinks = await page.$$('a.showDetail')
+  if (!detailLinks.length) return
+
+  let enrichedCount = 0
+
+  for (let d = 0; d < detailLinks.length && d < uniqueRecords.length; d++) {
+    try {
+      // Re-query links each iteration since DOM may have changed after popup close
+      const links = await page.$$('a.showDetail')
+      if (d >= links.length) break
+
+      // Set up a one-shot response promise BEFORE clicking
+      const detailResponsePromise = page.waitForResponse(
+        (response) => response.url().includes('/detail/detail'),
+        { timeout: 10000 }
+      ).catch(() => null)
+
+      // Click the detail link
+      await links[d].click()
+
+      // Wait for the AJAX response
+      const response = await detailResponsePromise
+      let detailHtml = null
+      if (response) {
+        detailHtml = await response.text().catch(() => null)
+      }
+
+      // Fallback: if waitForResponse missed it, try scraping the popup DOM directly
+      if (!detailHtml) {
+        await sleep(2000)
+        detailHtml = await page.evaluate(() => {
+          // Look for the detail popup/dialog content
+          const dialog = document.querySelector('.ui-dialog-content, .detail-popup, [role="dialog"], .modal-body')
+          return dialog ? dialog.innerHTML : null
+        }).catch(() => null)
+      }
+
+      if (detailHtml) {
+        // Decode HTML entities (&amp; -> &) before parsing URLs
+        const decodedHtml = detailHtml.replace(/&amp;/g, '&')
+        // Parse image URLs from the AJAX/popup HTML
+        const allImgUrls = [...new Set(
+          [...decodedHtml.matchAll(/(https?:\/\/imga\.asnet2\.com\/ImgGet[^"'\s<>]+)/gi)].map(m => m[1])
+        )]
+
+        if (allImgUrls.length > 0) {
+          // Photos: URLs without v5=1XX pattern (main vehicle photos)
+          const photos = allImgUrls.filter(u => !u.match(/v5=1\d{2}/))
+          // Sheets: URLs with v5=1XX pattern (auction sheet scans)
+          const sheets = allImgUrls.filter(u => u.match(/v5=1\d{2}/))
+
+          const updateData = { images: photos.length > 0 ? photos : allImgUrls }
+          if (sheets.length > 0) updateData.auction_sheet_url = sheets[0]
+
+          await supabase.from('auction_vehicles').update(updateData).eq('stock_number', uniqueRecords[d].stock_number)
+          enrichedCount++
+        }
+      }
+
+      // Close popup — try multiple strategies for headless reliability
+      await page.evaluate(() => {
+        // Strategy 1: Click close button
+        const closeBtn = document.querySelector('.ui-dialog-titlebar-close, .close, [title="Close"], button.close, a.close, span.close')
+        if (closeBtn) {
+          closeBtn.click()
+          return
+        }
+        // Strategy 2: Remove dialog from DOM entirely
+        const dialog = document.querySelector('.ui-dialog')
+        if (dialog) {
+          dialog.remove()
+          return
+        }
+        // Strategy 3: Click overlay/backdrop
+        const overlay = document.querySelector('.ui-widget-overlay, .modal-backdrop, .overlay')
+        if (overlay) overlay.click()
+      })
+
+      // Also send Escape key as additional close mechanism
+      await page.keyboard.press('Escape').catch(() => {})
+      await sleep(300)
+
+      // Verify popup is actually closed before continuing
+      const popupStillOpen = await page.evaluate(() => {
+        return !!document.querySelector('.ui-dialog:not([style*="display: none"])')
+      }).catch(() => false)
+
+      if (popupStillOpen) {
+        // Force remove any remaining dialogs
+        await page.evaluate(() => {
+          document.querySelectorAll('.ui-dialog, .ui-widget-overlay').forEach(el => el.remove())
+        }).catch(() => {})
+        await sleep(300)
+      }
+
+    } catch (e) {
+      // Non-critical enrichment error, continue to next vehicle
+    }
+
+    if ((d + 1) % 10 === 0) log(`    Enriched ${d + 1}/${detailLinks.length} (${enrichedCount} with images)...`)
+  }
+
+  log(`  Page ${pageNum}: enriched ${enrichedCount}/${detailLinks.length} with full images + auction sheets`)
 }
 
 main()
