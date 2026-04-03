@@ -330,28 +330,44 @@ async function main() {
 
 
         // Click search button
-        await Promise.all([
-          page.waitForNavigation({ waitUntil: 'networkidle2' }).catch(() => {}),
-          page.evaluate(() => {
-            const btns = document.querySelectorAll('button, input[type="submit"], a')
-            for (const btn of btns) {
-              if ((btn.textContent || btn.value || '').includes('Search') || (btn.textContent || '').includes('検索')) {
-                btn.click()
-                return true
-              }
+        const searchClicked = await page.evaluate(() => {
+          // Try various search button patterns
+          const btns = document.querySelectorAll('button, input[type="submit"], input[type="button"], a')
+          for (const btn of btns) {
+            const text = (btn.textContent || btn.value || '').trim()
+            // Japanese: 検索 = search, 絞り込み = narrow down
+            if (text.includes('検索') || text.includes('Search') || text.includes('search') || text.includes('絞り込み')) {
+              btn.click()
+              return text
             }
-            const form = document.querySelector('form')
-            if (form) { form.submit(); return true }
-            return false
-          }),
-        ])
+          }
+          // Try submitting the form that contains the MakerCode select
+          const makerSelect = document.querySelector('select[name*="MakerCode"]')
+          if (makerSelect) {
+            const form = makerSelect.closest('form')
+            if (form) { form.submit(); return 'form.submit()' }
+          }
+          return null
+        })
+        log(`  Search clicked: "${searchClicked}"`)
 
-        await page.waitForSelector('table', { timeout: 10000 }).catch(() => {})
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {})
+        await page.waitForSelector('table, .searchResult, .car_list', { timeout: 15000 }).catch(() => {})
 
-        // Get total count
+        log(`  Results URL: ${page.url()}`)
+
+        // Get total count — try both English and Japanese patterns
         const totalText = await page.evaluate(() => {
-          const match = document.body.textContent.match(/([\d,]+)\s*units?\s*found/i)
-          return match ? match[1].replace(/,/g, '') : '0'
+          const bodyText = document.body.textContent
+          // English: "4,001 units found"
+          let match = bodyText.match(/([\d,]+)\s*units?\s*found/i)
+          if (match) return match[1].replace(/,/g, '')
+          // Japanese: "4,001 件" or "4,001台"
+          match = bodyText.match(/([\d,]+)\s*件/)
+          if (match) return match[1].replace(/,/g, '')
+          match = bodyText.match(/([\d,]+)\s*台/)
+          if (match) return match[1].replace(/,/g, '')
+          return '0'
         })
         const totalCount = parseInt(totalText)
         log(`  Found ${totalCount} ${make.en} vehicles`)
