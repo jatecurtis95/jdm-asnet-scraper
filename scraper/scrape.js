@@ -329,32 +329,45 @@ async function main() {
         log(`  Selected: ${selected.optText} (value=${selected.optValue}) in dropdown "${selected.selectName}"`)
 
 
-        // Click search button
+        // Submit search — find and submit the form containing MakerCode
+        log(`  Submitting search form...`)
         const searchClicked = await page.evaluate(() => {
-          // Try various search button patterns
-          const btns = document.querySelectorAll('button, input[type="submit"], input[type="button"], a')
-          for (const btn of btns) {
-            const text = (btn.textContent || btn.value || '').trim()
-            // Japanese: 検索 = search, 絞り込み = narrow down
-            if (text.includes('検索') || text.includes('Search') || text.includes('search') || text.includes('絞り込み')) {
-              btn.click()
-              return text
-            }
-          }
-          // Try submitting the form that contains the MakerCode select
-          const makerSelect = document.querySelector('select[name*="MakerCode"]')
+          // First priority: find the form containing our MakerCode select and submit it
+          const makerSelect = document.querySelector('select[name="MultiForm[0].MakerCode"]')
           if (makerSelect) {
             const form = makerSelect.closest('form')
-            if (form) { form.submit(); return 'form.submit()' }
+            if (form) {
+              // Look for a submit button within this form
+              const submitBtn = form.querySelector('button[type="submit"], input[type="submit"], button:not([type])')
+              if (submitBtn) {
+                submitBtn.click()
+                return `form button: "${(submitBtn.textContent || submitBtn.value || '').trim()}"`
+              }
+              // No submit button found, try form.submit()
+              form.submit()
+              return 'form.submit() on MakerCode form'
+            }
+          }
+
+          // Fallback: find any search button on the page
+          const allBtns = document.querySelectorAll('button, input[type="submit"], input[type="button"], a.btn')
+          for (const btn of allBtns) {
+            const text = (btn.textContent || btn.value || '').trim()
+            if (text.includes('検索') || text.includes('Search')) {
+              btn.click()
+              return `button: "${text}"`
+            }
           }
           return null
         })
-        log(`  Search clicked: "${searchClicked}"`)
+        log(`  Search submitted: ${searchClicked}`)
 
+        // Wait for results to load
         await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {})
-        await page.waitForSelector('table, .searchResult, .car_list', { timeout: 15000 }).catch(() => {})
-
         log(`  Results URL: ${page.url()}`)
+
+        // Additional wait for dynamic content
+        await page.waitForSelector('table tr td, .searchResult', { timeout: 10000 }).catch(() => {})
 
         // Get total count — try both English and Japanese patterns
         const totalText = await page.evaluate(() => {
