@@ -1,0 +1,34 @@
+name: Nightly ASNET Sync
+
+on:
+  schedule:
+    # Run at midnight AEST (2pm UTC previous day)
+    - cron: '0 14 * * *'
+  workflow_dispatch: # Allow manual trigger from GitHub UI
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        working-directory: ./scraper
+        run: npm install
+
+      - name: Run scraper
+        working-directory: ./scraper
+        env:
+          ASNET_USERNAME: ${{ secrets.ASNET_USERNAME }}
+          ASNET_PASSWORD: ${{ secrets.ASNET_PASSWORD }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: node scrape.js
