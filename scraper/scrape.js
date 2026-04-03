@@ -9,9 +9,18 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY
 const TEST_MODE = process.argv.includes('--test')
 const MAX_PAGES_PER_MAKE = TEST_MODE ? 1 : 200
 
+// Make names in both English and Japanese for matching
 const MAKES = [
-  'TOYOTA', 'NISSAN', 'HONDA', 'MAZDA', 'SUBARU',
-  'MITSUBISHI', 'SUZUKI', 'DAIHATSU', 'LEXUS', 'ISUZU',
+  { en: 'TOYOTA', jp: 'トヨタ' },
+  { en: 'NISSAN', jp: '日産' },
+  { en: 'HONDA', jp: 'ホンダ' },
+  { en: 'MAZDA', jp: 'マツダ' },
+  { en: 'SUBARU', jp: 'スバル' },
+  { en: 'MITSUBISHI', jp: '三菱' },
+  { en: 'SUZUKI', jp: 'スズキ' },
+  { en: 'DAIHATSU', jp: 'ダイハツ' },
+  { en: 'LEXUS', jp: 'レクサス' },
+  { en: 'ISUZU', jp: 'いすゞ' },
 ]
 
 if (!ASNET_USER || !ASNET_PASS) {
@@ -264,56 +273,61 @@ async function main() {
     // ─── Step 2: Scrape each make ────────────────────────────────────
     let grandTotal = 0
 
+    // First, identify the make dropdown by logging all select options on the search page
+    if (MAKES.length > 0) {
+      const makeDropdownInfo = await page.evaluate(() => {
+        const selects = document.querySelectorAll('select')
+        const results = []
+        selects.forEach((sel, i) => {
+          const opts = sel.querySelectorAll('option')
+          if (opts.length > 5 && opts.length < 200) {
+            const sampleOpts = Array.from(opts).slice(0, 8).map(o => `${o.value}:${o.textContent.trim()}`)
+            const name = sel.name || sel.id || sel.className || `select_${i}`
+            results.push({ index: i, name, optCount: opts.length, samples: sampleOpts })
+          }
+        })
+        return results
+      })
+      log(`Large select dropdowns: ${JSON.stringify(makeDropdownInfo.slice(0, 5))}`)
+    }
+
     for (let m = 0; m < MAKES.length; m++) {
       const make = MAKES[m]
-      log(`\n[${m + 1}/${MAKES.length}] Scraping ${make}...`)
+      log(`\n[${m + 1}/${MAKES.length}] Scraping ${make.en}...`)
 
       try {
-        // Navigate to Direct Search
-        await page.goto('https://www.asnet.jp/asnet/search/ippatsusearchlist', {
+        // Navigate to search page (use the URL we know works after login)
+        await page.goto('https://www.asnet.jp/asnet/search/search', {
           waitUntil: 'networkidle2',
           timeout: 30000,
         })
 
-        // Wait for page to be ready — look for select or any form element
-        await page.waitForSelector('select, form, input', { timeout: 15000 }).catch(() => {})
+        await page.waitForSelector('select', { timeout: 15000 }).catch(() => {})
 
-        // Log what we see for debugging
-        const pageInfo = await page.evaluate(() => ({
-          url: window.location.href,
-          title: document.title,
-          selectCount: document.querySelectorAll('select').length,
-          formCount: document.querySelectorAll('form').length,
-          bodySnippet: document.body?.textContent?.substring(0, 200),
-        }))
-        log(`  Page: ${pageInfo.url} | ${pageInfo.selectCount} selects, ${pageInfo.formCount} forms`)
-
-        if (pageInfo.selectCount === 0) {
-          log(`  No select dropdowns found, page may not have loaded. Skipping ${make}`)
-          log(`  Body: ${pageInfo.bodySnippet}`)
-          continue
-        }
-
-        // Select the make from the dropdown
-        const selected = await page.evaluate((makeName) => {
+        // Select the make from the dropdown — try both English and Japanese names
+        const selected = await page.evaluate((makeEn, makeJp) => {
           const selects = document.querySelectorAll('select')
           for (const sel of selects) {
             const options = sel.querySelectorAll('option')
             for (const opt of options) {
-              if (opt.textContent.toUpperCase().includes(makeName)) {
+              const text = opt.textContent.trim().toUpperCase()
+              const val = (opt.value || '').toUpperCase()
+              if (text.includes(makeEn) || text.includes(makeJp) || val.includes(makeEn)) {
                 sel.value = opt.value
                 sel.dispatchEvent(new Event('change', { bubbles: true }))
-                return true
+                return { found: true, selectName: sel.name || sel.id, optValue: opt.value, optText: opt.textContent.trim() }
               }
             }
           }
-          return false
-        }, make)
+          return { found: false }
+        }, make.en, make.jp)
 
-        if (!selected) {
-          log(`  Could not find ${make} in dropdown, skipping`)
+        if (!selected.found) {
+          log(`  Could not find ${make.en} / ${make.jp} in any dropdown, skipping`)
           continue
         }
+        log(`  Selected: ${selected.optText} (value=${selected.optValue}) in dropdown "${selected.selectName}"`)
+
 
         // Click search button
         await Promise.all([
@@ -340,7 +354,7 @@ async function main() {
           return match ? match[1].replace(/,/g, '') : '0'
         })
         const totalCount = parseInt(totalText)
-        log(`  Found ${totalCount} ${make} vehicles`)
+        log(`  Found ${totalCount} ${make.en} vehicles`)
 
         if (totalCount === 0) continue
 
@@ -350,7 +364,7 @@ async function main() {
 
         while (pageNum <= MAX_PAGES_PER_MAKE) {
           // Scrape current page
-          const vehicles = await page.evaluate((makeName) => {
+          const vehicles = await page.evaluate(() => {
             // Map header columns
             const colMap = {}
             const allRows = document.querySelectorAll('table tr')
@@ -486,7 +500,7 @@ async function main() {
               })
             }
             return vehicles
-          }, make)
+          })
 
           if (!vehicles.length) break
 
@@ -616,10 +630,10 @@ async function main() {
         }
 
         grandTotal += makeTotal
-        log(`  ${make} complete: ${makeTotal} vehicles synced`)
+        log(`  ${make.en} complete: ${makeTotal} vehicles synced`)
 
       } catch (e) {
-        log(`  Error scraping ${make}: ${e.message}`)
+        log(`  Error scraping ${make.en}: ${e.message}`)
       }
     }
 
