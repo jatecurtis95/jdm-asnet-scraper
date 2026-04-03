@@ -73,7 +73,7 @@ function log(msg) {
 
 // ─── Main scraper ────────────────────────────────────────────────────────────
 async function main() {
-  log('Starting ASNET scraper v3...')
+  log('Starting ASNET scraper v10...')
   log(`Mode: ${TEST_MODE ? 'TEST (1 page per make)' : 'FULL'}`)
 
   const browser = await puppeteer.launch({
@@ -199,6 +199,25 @@ async function main() {
     log('Login successful!')
 
     // Handle any post-login interstitial pages
+    // Switch to English mode
+    log('Switching to English...')
+    const switched = await page.evaluate(() => {
+      const links = document.querySelectorAll('a')
+      for (const link of links) {
+        if (link.textContent.trim() === 'English' || link.textContent.trim().includes('English')) {
+          link.click()
+          return true
+        }
+      }
+      return false
+    })
+    if (switched) {
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {})
+      log(`  Switched to English: ${page.url()}`)
+    } else {
+      log('  Could not find English switch')
+    }
+
     log('Handling post-login pages...')
     log(`Current URL after login: ${page.url()}`)
     const bodySnippet = await page.evaluate(() => document.body?.textContent?.replace(/\s+/g, ' ').substring(0, 300))
@@ -270,30 +289,25 @@ async function main() {
 
     log(`Search page ready: ${page.url()}`)
 
-    // Click on "Direct Search" tab
-    log('Looking for Direct Search tab...')
-    const tabClicked = await page.evaluate(() => {
-      const els = document.querySelectorAll('a, li, div, span, button, label')
-      for (const el of els) {
-        const text = el.textContent.trim()
-        if (text === 'Direct Search' || text === '直接検索' || text.includes('ダイレクトサーチ')) {
-          el.click()
-          return text.substring(0, 50)
+    // Click on "Direct Search" / "Buy at AA Bid" tab
+    log('Clicking Direct Search tab...')
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
+      page.evaluate(() => {
+        const els = document.querySelectorAll('a')
+        for (const el of els) {
+          const text = el.textContent.trim()
+          if (text.includes('Direct Search') || text.includes('AA Bid') || text.includes('Buy at AA Bid') || text.includes('AA入札で買う') || text.includes('直接検索')) {
+            el.click()
+            return text.substring(0, 50)
+          }
         }
-      }
-      // Try "AA入札で買う" as fallback
-      for (const el of els) {
-        const text = el.textContent.trim()
-        if (text === 'AA入札で買う') {
-          el.click()
-          return text
-        }
-      }
-      return null
-    })
-    log(`  Clicked tab: "${tabClicked}"`)
+        return null
+      }),
+    ])
     await new Promise(r => setTimeout(r, 3000))
-    log(`  URL after tab: ${page.url()}`)
+    log(`  Search tab loaded: ${page.url()}`)
+    await page.waitForSelector('select', { timeout: 10000 }).catch(() => {})
 
     // ─── Step 2: Scrape each make ────────────────────────────────────
     let grandTotal = 0
@@ -321,92 +335,62 @@ async function main() {
       log(`\n[${m + 1}/${MAKES.length}] Scraping ${make.en}...`)
 
       try {
-        // Navigate to search page (use the URL we know works after login)
-        await page.goto('https://www.asnet.jp/asnet/search/search', {
+        // Navigate to AA Bid search page
+        await page.goto('https://www.asnet.jp/asnet/search/search?initmode=201', {
           waitUntil: 'networkidle2',
-          timeout: 30000,
+          timeout: 60000,
         })
+        await page.waitForSelector('select[name="MultiForm[0].MakerCode"]', { timeout: 10000 })
 
-        await page.waitForSelector('select', { timeout: 15000 }).catch(() => {})
-
-        // Select the make from the dropdown — try both English and Japanese names
-        const selected = await page.evaluate((makeEn, makeJp) => {
-          const selects = document.querySelectorAll('select')
-          for (const sel of selects) {
-            const options = sel.querySelectorAll('option')
-            for (const opt of options) {
-              const text = opt.textContent.trim().toUpperCase()
-              const val = (opt.value || '').toUpperCase()
-              if (text.includes(makeEn) || text.includes(makeJp) || val.includes(makeEn)) {
-                sel.value = opt.value
-                sel.dispatchEvent(new Event('change', { bubbles: true }))
-                return { found: true, selectName: sel.name || sel.id, optValue: opt.value, optText: opt.textContent.trim() }
-              }
-            }
-          }
-          return { found: false }
-        }, make.en, make.jp)
-
-        if (!selected.found) {
-          log(`  Could not find ${make.en} / ${make.jp} in any dropdown, skipping`)
-          continue
-        }
-        log(`  Selected: ${selected.optText} (value=${selected.optValue}) in dropdown "${selected.selectName}"`)
-
-
-        // Submit search — find and submit the form containing MakerCode
-        log(`  Submitting search form...`)
-        const searchClicked = await page.evaluate(() => {
-          // First priority: find the form containing our MakerCode select and submit it
-          const makerSelect = document.querySelector('select[name="MultiForm[0].MakerCode"]')
-          if (makerSelect) {
-            const form = makerSelect.closest('form')
-            if (form) {
-              // Look for a submit button within this form
-              const submitBtn = form.querySelector('button[type="submit"], input[type="submit"], button:not([type])')
-              if (submitBtn) {
-                submitBtn.click()
-                return `form button: "${(submitBtn.textContent || submitBtn.value || '').trim()}"`
-              }
-              // No submit button found, try form.submit()
-              form.submit()
-              return 'form.submit() on MakerCode form'
-            }
-          }
-
-          // Fallback: find any search button on the page
-          const allBtns = document.querySelectorAll('button, input[type="submit"], input[type="button"], a.btn')
-          for (const btn of allBtns) {
-            const text = (btn.textContent || btn.value || '').trim()
-            if (text.includes('検索') || text.includes('Search')) {
-              btn.click()
-              return `button: "${text}"`
-            }
+        // Find the option value for this make
+        const optValue = await page.evaluate((makeEn, makeJp) => {
+          const sel = document.querySelector('select[name="MultiForm[0].MakerCode"]')
+          if (!sel) return null
+          for (const opt of sel.options) {
+            const text = opt.textContent.trim().toUpperCase()
+            if (text.includes(makeEn) || text.includes(makeJp)) return opt.value
           }
           return null
-        })
-        log(`  Search submitted: ${searchClicked}`)
+        }, make.en, make.jp)
 
-        // Wait for results — ASNET is a SPA, so wait for AJAX/DOM changes, not page navigation
-        // Wait for navigation OR timeout (SPA won't navigate)
-        await Promise.race([
-          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {}),
-          new Promise(r => setTimeout(r, 8000)),
-        ])
+        if (!optValue) {
+          log(`  Could not find ${make.en} in dropdown, skipping`)
+          continue
+        }
+
+        // Set value and submit form directly (bypasses the 0台 counter issue)
+        const navPromise = page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => 'timeout')
+        await page.evaluate((val) => {
+          const sel = document.querySelector('select[name="MultiForm[0].MakerCode"]')
+          sel.value = val
+          sel.closest('form').submit()
+        }, optValue)
+        await navPromise
+        log(`  Selected ${make.en} (value=${optValue}), results: ${page.url()}`)
+
         log(`  Results URL: ${page.url()}`)
 
-        // Wait for results table to appear in DOM
-        await page.waitForSelector('table tr td', { timeout: 10000 }).catch(() => {})
+        // Wait for results table
+        await page.waitForSelector('table tr td', { timeout: 15000 }).catch(() => {})
 
-        // Log what's on the page now
-        const resultsInfo = await page.evaluate(() => ({
-          url: window.location.href,
-          bodySnippet: document.body.textContent.replace(/\s+/g, ' ').substring(0, 300),
-          tableRows: document.querySelectorAll('table tr').length,
-          hasLotNo: document.body.textContent.includes('Lot No') || document.body.textContent.includes('Lot No.'),
-        }))
-        log(`  Results: ${resultsInfo.tableRows} table rows, hasLotNo: ${resultsInfo.hasLotNo}`)
-        log(`  Content: ${resultsInfo.bodySnippet.substring(0, 200)}`)
+        // Check if we're on a results page
+        const resultsCheck = await page.evaluate(() => {
+          const text = document.body.textContent
+          const rows = document.querySelectorAll('table tr').length
+          // Check for "units found" or Japanese equivalents
+          const unitsMatch = text.match(/([\d,]+)\s*(units?\s*found|件|台)/i)
+          return {
+            url: window.location.href,
+            rows,
+            units: unitsMatch ? unitsMatch[1].replace(/,/g, '') : '0',
+            hasResults: rows > 5 && (text.includes('Lot No') || text.includes('TOYOTA') || text.includes('NISSAN') || text.includes('HONDA') || text.includes('トヨタ')),
+            snippet: text.replace(/\s+/g, ' ').substring(0, 300),
+          }
+        })
+        log(`  ${resultsCheck.rows} rows, ${resultsCheck.units} units, hasResults: ${resultsCheck.hasResults}`)
+        if (!resultsCheck.hasResults) {
+          log(`  Page content: ${resultsCheck.snippet.substring(0, 200)}`)
+        }
 
         // Get total count — try both English and Japanese patterns
         const totalText = await page.evaluate(() => {
@@ -598,87 +582,91 @@ async function main() {
             }))
             .filter(r => r.year && r.make)
 
-          if (records.length) {
+          // Deduplicate by stock_number (same lot can appear twice in a page)
+          const seen = new Set()
+          const uniqueRecords = records.filter(r => {
+            if (seen.has(r.stock_number)) return false
+            seen.add(r.stock_number)
+            return true
+          })
+
+          if (uniqueRecords.length) {
             const { error } = await supabase
               .from('auction_vehicles')
-              .upsert(records, { onConflict: 'stock_number' })
+              .upsert(uniqueRecords, { onConflict: 'stock_number' })
 
             if (error) {
               log(`  Page ${pageNum}: upsert error: ${error.message}`)
             } else {
-              makeTotal += records.length
+              makeTotal += uniqueRecords.length
               log(`  Page ${pageNum}: ${records.length} vehicles synced`)
             }
           }
 
-          // ─── Enrich with detail images ─────────────────────────────
+          // ─── Enrich with detail images (click popup, capture DOM images) ──
           const detailLinks = await page.$$('a.showDetail')
-          if (detailLinks.length > 0) {
-            log(`  Page ${pageNum}: enriching ${detailLinks.length} vehicles with detail images...`)
+          let enrichedCount = 0
 
-            for (let d = 0; d < detailLinks.length && d < vehicles.length; d++) {
-              try {
-                // Re-query the links (DOM may have changed)
-                const links = await page.$$('a.showDetail')
-                if (d >= links.length) break
-
-                await links[d].click()
-                await page.waitForTimeout(2000)
-
-                // Scrape all images from the popup
-                const enrichment = await page.evaluate((stockNum) => {
-                  const imgs = document.querySelectorAll('img')
-                  const images = []
-                  let sheetUrl = null
-
-                  imgs.forEach(img => {
-                    const src = img.src || ''
-                    if (!src || src.length < 20) return
-                    if (src.includes('spacer') || src.includes('icon') || src.includes('btn_')) return
-                    if (src.includes('arrow') || src.includes('logo') || src.includes('bg_')) return
-                    if (src.includes('google') || src.includes('gstatic')) return
-                    if (src.includes('asnet') || src.includes('ASDATA') || src.includes('imgm.')) {
-                      if (!images.includes(src)) images.push(src)
-                    }
-                  })
-
-                  // Heuristic: largest image is likely the auction sheet
-                  if (images.length > 2) {
-                    imgs.forEach(img => {
-                      if (img.src && images.includes(img.src)) {
-                        const rect = img.getBoundingClientRect()
-                        if (rect.width > 300 && rect.height > 200) sheetUrl = img.src
-                      }
-                    })
-                  }
-
-                  const vehiclePhotos = sheetUrl ? images.filter(s => s !== sheetUrl) : images
-                  return { stock_number: stockNum, images: vehiclePhotos, auction_sheet_url: sheetUrl }
-                }, vehicles[d].stock_number)
-
-                if (enrichment.images.length > 0 || enrichment.auction_sheet_url) {
-                  const updateData = { images: enrichment.images }
-                  if (enrichment.auction_sheet_url) updateData.auction_sheet_url = enrichment.auction_sheet_url
-
-                  await supabase
-                    .from('auction_vehicles')
-                    .update(updateData)
-                    .eq('stock_number', enrichment.stock_number)
-                }
-
-                // Close popup
-                await page.evaluate(() => {
-                  const closeBtn = document.querySelector('.ui-dialog-titlebar-close, .close, [title="Close"], button.close, a.close, span.close')
-                  if (closeBtn) closeBtn.click()
-                  else document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }))
-                })
-                await page.waitForTimeout(500)
-
-              } catch (e) {
-                // Non-critical, continue
-              }
+          // Set up AJAX response capture for detail endpoint
+          let lastDetailHtml = null
+          const detailResponseHandler = async (response) => {
+            if (response.url().includes('/detail/detail')) {
+              lastDetailHtml = await response.text().catch(() => null)
             }
           }
+          page.on('response', detailResponseHandler)
+
+          for (let d = 0; d < detailLinks.length && d < uniqueRecords.length; d++) {
+            try {
+              lastDetailHtml = null
+              const links = await page.$$('a.showDetail')
+              if (d >= links.length) break
+
+              await links[d].click()
+
+              // Wait for the detail AJAX response (max 8 seconds)
+              let waited = 0
+              while (!lastDetailHtml && waited < 8000) {
+                await new Promise(r => setTimeout(r, 500))
+                waited += 500
+              }
+
+              if (lastDetailHtml) {
+                // Decode HTML entities (&amp; -> &) before parsing URLs
+                const decodedHtml = lastDetailHtml.replace(/&amp;/g, '&')
+                // Parse image URLs from the AJAX HTML response
+                const allImgUrls = [...new Set(
+                  [...decodedHtml.matchAll(/(https?:\/\/imga\.asnet2\.com\/ImgGet[^"'\s<>]+)/gi)].map(m => m[1])
+                )]
+
+                if (allImgUrls.length > 0) {
+                  const photos = allImgUrls.filter(u => !u.match(/v5=1\d{2}/))
+                  const sheets = allImgUrls.filter(u => u.match(/v5=1\d{2}/))
+
+                  const updateData = { images: photos.length > 0 ? photos : allImgUrls }
+                  if (sheets.length > 0) updateData.auction_sheet_url = sheets[0]
+
+                  await supabase.from('auction_vehicles').update(updateData).eq('stock_number', uniqueRecords[d].stock_number)
+                  enrichedCount++
+                }
+              }
+
+              // Close popup
+              await page.evaluate(() => {
+                const closeBtn = document.querySelector('.ui-dialog-titlebar-close, .close, [title="Close"], button.close, a.close, span.close')
+                if (closeBtn) closeBtn.click()
+                else document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }))
+              })
+              await new Promise(r => setTimeout(r, 500))
+            } catch (e) {
+              // Non-critical, continue
+            }
+
+            if ((d + 1) % 10 === 0) log(`    Enriched ${d + 1}/${detailLinks.length} (${enrichedCount} with images)...`)
+          }
+
+          page.off('response', detailResponseHandler)
+          log(`  Page ${pageNum}: enriched ${enrichedCount}/${detailLinks.length} with full images + auction sheets`)
 
           // Go to next page
           const hasNext = await page.evaluate(() => {
