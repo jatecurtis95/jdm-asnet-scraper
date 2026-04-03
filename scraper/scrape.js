@@ -25,9 +25,10 @@ const MAKES = [
 // Each chunk is searched separately to avoid exceeding pagination limits
 const YEAR_RANGES = [
   { from: 1990, to: 2005 },
-  { from: 2006, to: 2015 },
-  { from: 2016, to: 2020 },
-  { from: 2021, to: 2030 },
+  { from: 2006, to: 2012 },
+  { from: 2013, to: 2018 },
+  { from: 2019, to: 2022 },
+  { from: 2023, to: 2030 },
 ]
 // Makes that need year-range splitting due to high result counts (4000+)
 const HIGH_VOLUME_MAKES = ['TOYOTA', 'NISSAN', 'HONDA']
@@ -417,59 +418,35 @@ async function scrapeMakeRange(page, make, yearRange) {
     const sel = document.querySelector('select[name="MultiForm[0].MakerCode"]')
     sel.value = val
 
-    // Set year range if provided
+    // Set year range if provided — ASNET uses ModelYearFrom / ModelYearTo
+    // Option values are the year number directly (e.g., "2020")
     if (yearRange) {
-      // Try common year dropdown selectors used on ASNET search forms
-      const yearFromNames = [
-        'MultiForm[0].YearFrom', 'MultiForm[0].NenFrom', 'MultiForm[0].yearFrom',
-        'yearFrom', 'NenFrom', 'year_from',
-      ]
-      const yearToNames = [
-        'MultiForm[0].YearTo', 'MultiForm[0].NenTo', 'MultiForm[0].yearTo',
-        'yearTo', 'NenTo', 'year_to',
-      ]
+      // There are multiple ModelYearFrom/To selects on the page (cars, bikes, trucks tabs)
+      // We need the FIRST one which is in the cars section
+      const fromSel = document.querySelector('select[name="ModelYearFrom"]')
+      const toSel = document.querySelector('select[name="ModelYearTo"]')
 
-      // Find and set year-from dropdown
-      for (const name of yearFromNames) {
-        const fromSel = document.querySelector(`select[name="${name}"]`)
-        if (fromSel) {
-          // Find closest matching option value
-          for (const opt of fromSel.options) {
-            const optVal = parseInt(opt.value)
-            const optText = parseInt(opt.textContent)
-            if (optVal === yearRange.from || optText === yearRange.from) {
-              fromSel.value = opt.value
-              break
-            }
-          }
-          break
+      if (fromSel) {
+        // Find closest year option >= yearRange.from
+        let bestOpt = null
+        for (const opt of fromSel.options) {
+          const v = parseInt(opt.value)
+          if (v === yearRange.from) { bestOpt = opt.value; break }
+          // If exact year not found, find the closest available year >= from
+          if (v >= yearRange.from && v > 0 && (!bestOpt || v < parseInt(bestOpt))) bestOpt = opt.value
         }
+        if (bestOpt) fromSel.value = bestOpt
       }
 
-      // Find and set year-to dropdown
-      for (const name of yearToNames) {
-        const toSel = document.querySelector(`select[name="${name}"]`)
-        if (toSel) {
-          for (const opt of toSel.options) {
-            const optVal = parseInt(opt.value)
-            const optText = parseInt(opt.textContent)
-            if (optVal === yearRange.to || optText === yearRange.to) {
-              toSel.value = opt.value
-              break
-            }
-          }
-          break
+      if (toSel) {
+        // Find closest year option <= yearRange.to
+        let bestOpt = null
+        for (const opt of toSel.options) {
+          const v = parseInt(opt.value)
+          if (v === yearRange.to) { bestOpt = opt.value; break }
+          if (v <= yearRange.to && v > 0 && (!bestOpt || v > parseInt(bestOpt))) bestOpt = opt.value
         }
-      }
-
-      // Also try Japanese-era year selects — look for any select near "年式" label
-      const allSelects = document.querySelectorAll('select')
-      for (const s of allSelects) {
-        const nameL = (s.name || '').toLowerCase()
-        if (nameL.includes('nen') || nameL.includes('year')) {
-          // Log for debugging — these will be in the year dropdown area
-          console.log(`Found year-related select: ${s.name}, options: ${s.options.length}`)
-        }
+        if (bestOpt) toSel.value = bestOpt
       }
     }
 
@@ -732,47 +709,48 @@ async function scrapeMakeRange(page, make, yearRange) {
 }
 
 // ─── Image enrichment — click detail popups and capture AJAX image URLs ──────
+// Uses page.evaluate click (not native .click()) to avoid protocolTimeout in headless.
+// Uses page.on('response') event listener pattern which is proven reliable.
 async function enrichPageWithImages(page, uniqueRecords, pageNum) {
-  const detailLinks = await page.$$('a.showDetail')
-  if (!detailLinks.length) return
+  const detailLinkCount = (await page.$$('a.showDetail')).length
+  if (!detailLinkCount) return
 
   let enrichedCount = 0
 
-  for (let d = 0; d < detailLinks.length && d < uniqueRecords.length; d++) {
+  for (let d = 0; d < detailLinkCount && d < uniqueRecords.length; d++) {
     try {
-      // Re-query links each iteration since DOM may have changed after popup close
-      const links = await page.$$('a.showDetail')
-      if (d >= links.length) break
-
-      // Set up a one-shot response promise BEFORE clicking
-      const detailResponsePromise = page.waitForResponse(
-        (response) => response.url().includes('/detail/detail'),
-        { timeout: 10000 }
-      ).catch(() => null)
-
-      // Click the detail link
-      await links[d].click()
-
-      // Wait for the AJAX response
-      const response = await detailResponsePromise
-      let detailHtml = null
-      if (response) {
-        detailHtml = await response.text().catch(() => null)
+      // Set up AJAX response capture BEFORE clicking
+      let ajaxHtml = null
+      const handler = async (response) => {
+        if (response.url().includes('/detail')) {
+          ajaxHtml = await response.text().catch(() => null)
+        }
       }
+      page.on('response', handler)
 
-      // Fallback: if waitForResponse missed it, try scraping the popup DOM directly
-      if (!detailHtml) {
-        await sleep(2000)
-        detailHtml = await page.evaluate(() => {
-          // Look for the detail popup/dialog content
-          const dialog = document.querySelector('.ui-dialog-content, .detail-popup, [role="dialog"], .modal-body')
+      // Click via page.evaluate (JS-level click — returns instantly in headless)
+      // Native Puppeteer .click() hangs in headless due to scroll/mouse protocol overhead
+      await page.evaluate((idx) => {
+        const links = document.querySelectorAll('a.showDetail')
+        if (links[idx]) links[idx].click()
+      }, d)
+
+      // Wait for the AJAX response (8s matches the proven test-images.js pattern)
+      await sleep(8000)
+
+      page.off('response', handler)
+
+      // Fallback: if event listener missed AJAX, try scraping popup DOM directly
+      if (!ajaxHtml) {
+        ajaxHtml = await page.evaluate(() => {
+          const dialog = document.querySelector('.ui-dialog-content')
           return dialog ? dialog.innerHTML : null
         }).catch(() => null)
       }
 
-      if (detailHtml) {
+      if (ajaxHtml) {
         // Decode HTML entities (&amp; -> &) before parsing URLs
-        const decodedHtml = detailHtml.replace(/&amp;/g, '&')
+        const decodedHtml = ajaxHtml.replace(/&amp;/g, '&')
         // Parse image URLs from the AJAX/popup HTML
         const allImgUrls = [...new Set(
           [...decodedHtml.matchAll(/(https?:\/\/imga\.asnet2\.com\/ImgGet[^"'\s<>]+)/gi)].map(m => m[1])
@@ -792,50 +770,27 @@ async function enrichPageWithImages(page, uniqueRecords, pageNum) {
         }
       }
 
-      // Close popup — try multiple strategies for headless reliability
-      await page.evaluate(() => {
-        // Strategy 1: Click close button
-        const closeBtn = document.querySelector('.ui-dialog-titlebar-close, .close, [title="Close"], button.close, a.close, span.close')
-        if (closeBtn) {
-          closeBtn.click()
-          return
-        }
-        // Strategy 2: Remove dialog from DOM entirely
-        const dialog = document.querySelector('.ui-dialog')
-        if (dialog) {
-          dialog.remove()
-          return
-        }
-        // Strategy 3: Click overlay/backdrop
-        const overlay = document.querySelector('.ui-widget-overlay, .modal-backdrop, .overlay')
-        if (overlay) overlay.click()
-      })
-
-      // Also send Escape key as additional close mechanism
+      // Close popup — Escape key + force DOM cleanup (most reliable in headless)
       await page.keyboard.press('Escape').catch(() => {})
       await sleep(300)
-
-      // Verify popup is actually closed before continuing
-      const popupStillOpen = await page.evaluate(() => {
-        return !!document.querySelector('.ui-dialog:not([style*="display: none"])')
-      }).catch(() => false)
-
-      if (popupStillOpen) {
-        // Force remove any remaining dialogs
-        await page.evaluate(() => {
-          document.querySelectorAll('.ui-dialog, .ui-widget-overlay').forEach(el => el.remove())
-        }).catch(() => {})
-        await sleep(300)
-      }
+      await page.evaluate(() => {
+        document.querySelectorAll('.ui-dialog, .ui-widget-overlay').forEach(el => el.remove())
+      }).catch(() => {})
+      await sleep(500)
 
     } catch (e) {
-      // Non-critical enrichment error, continue to next vehicle
+      // Non-critical enrichment error — close any leftover popup and continue
+      await page.keyboard.press('Escape').catch(() => {})
+      await page.evaluate(() => {
+        document.querySelectorAll('.ui-dialog, .ui-widget-overlay').forEach(el => el.remove())
+      }).catch(() => {})
+      await sleep(500)
     }
 
-    if ((d + 1) % 10 === 0) log(`    Enriched ${d + 1}/${detailLinks.length} (${enrichedCount} with images)...`)
+    if ((d + 1) % 10 === 0) log(`    Enriched ${d + 1}/${detailLinkCount} (${enrichedCount} with images)...`)
   }
 
-  log(`  Page ${pageNum}: enriched ${enrichedCount}/${detailLinks.length} with full images + auction sheets`)
+  log(`  Page ${pageNum}: enriched ${enrichedCount}/${detailLinkCount} with full images + auction sheets`)
 }
 
 main()
