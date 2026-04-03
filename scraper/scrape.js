@@ -64,7 +64,7 @@ function log(msg) {
 
 // ─── Main scraper ────────────────────────────────────────────────────────────
 async function main() {
-  log('Starting ASNET scraper...')
+  log('Starting ASNET scraper v3...')
   log(`Mode: ${TEST_MODE ? 'TEST (1 page per make)' : 'FULL'}`)
 
   const browser = await puppeteer.launch({
@@ -157,25 +157,77 @@ async function main() {
     }
     log('Login step complete')
 
-    // Handle any post-login interstitial pages (popups, agreements, landing pages)
+    // Handle any post-login interstitial pages
+    log('Handling post-login pages...')
+    log(`Current URL after login: ${page.url()}`)
+    const bodySnippet = await page.evaluate(() => document.body?.textContent?.replace(/\s+/g, ' ').substring(0, 300))
+    log(`Page content: ${bodySnippet}`)
+
+    // Click through any interstitial buttons/links
     await page.evaluate(() => {
-      // Click through any "proceed" or "agree" buttons
       const btns = document.querySelectorAll('a, button, input[type="submit"]')
       for (const btn of btns) {
         const text = (btn.textContent || btn.value || '').trim()
-        if (text.includes('進む') || text.includes('Proceed') || text.includes('OK') || text.includes('同意') || text.includes('Agree')) {
+        if (text.includes('進む') || text.includes('Proceed') || text.includes('OK') || text.includes('同意') || text.includes('Buy at Auction') || text.includes('Direct Search')) {
           btn.click()
-          return true
+          return text
         }
       }
-      return false
+      return null
     })
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {})
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {})
+    log(`After interstitial: ${page.url()}`)
 
-    // Navigate directly to the Direct Search page
-    log('Navigating to Direct Search...')
-    await page.goto('https://www.asnet.jp/asnet/search/ippatsusearchlist', { waitUntil: 'networkidle2', timeout: 30000 })
-    log(`Search page URL: ${page.url()}`)
+    // Try multiple search page URLs
+    const searchUrls = [
+      'https://www.asnet.jp/asnet/search/ippatsusearchlist',
+      'https://www.asnet.jp/asnet/search/',
+      'https://www.asnet.jp/asnet/',
+    ]
+    let searchPageReady = false
+
+    for (const searchUrl of searchUrls) {
+      log(`Trying search URL: ${searchUrl}`)
+      await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {})
+      log(`  Landed on: ${page.url()}`)
+
+      const hasSelects = await page.evaluate(() => document.querySelectorAll('select').length)
+      log(`  Found ${hasSelects} select dropdowns`)
+
+      if (hasSelects > 0) {
+        searchPageReady = true
+        break
+      }
+
+      // Maybe we got redirected to login — check
+      if (page.url().includes('login')) {
+        log('  Redirected to login — session may not be valid')
+        break
+      }
+    }
+
+    if (!searchPageReady) {
+      // Last resort: try clicking "Buy at Auction" or "Direct Search" from whatever page we're on
+      log('Could not reach search page via URL. Trying to find search link on current page...')
+      const clickedLink = await page.evaluate(() => {
+        const links = document.querySelectorAll('a')
+        for (const link of links) {
+          const text = link.textContent.trim()
+          if (text.includes('Buy at Auction') || text.includes('Direct Search') || text.includes('直接検索') || text.includes('ippatsusearchlist')) {
+            link.click()
+            return text
+          }
+        }
+        return null
+      })
+      if (clickedLink) {
+        log(`  Clicked: "${clickedLink}"`)
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {})
+        log(`  Now at: ${page.url()}`)
+      }
+    }
+
+    log(`Search page ready: ${page.url()}`)
 
     // ─── Step 2: Scrape each make ────────────────────────────────────
     let grandTotal = 0
