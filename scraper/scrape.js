@@ -270,6 +270,31 @@ async function main() {
 
     log(`Search page ready: ${page.url()}`)
 
+    // Click on "Direct Search" tab
+    log('Looking for Direct Search tab...')
+    const tabClicked = await page.evaluate(() => {
+      const els = document.querySelectorAll('a, li, div, span, button, label')
+      for (const el of els) {
+        const text = el.textContent.trim()
+        if (text === 'Direct Search' || text === '直接検索' || text.includes('ダイレクトサーチ')) {
+          el.click()
+          return text.substring(0, 50)
+        }
+      }
+      // Try "AA入札で買う" as fallback
+      for (const el of els) {
+        const text = el.textContent.trim()
+        if (text === 'AA入札で買う') {
+          el.click()
+          return text
+        }
+      }
+      return null
+    })
+    log(`  Clicked tab: "${tabClicked}"`)
+    await new Promise(r => setTimeout(r, 3000))
+    log(`  URL after tab: ${page.url()}`)
+
     // ─── Step 2: Scrape each make ────────────────────────────────────
     let grandTotal = 0
 
@@ -362,12 +387,26 @@ async function main() {
         })
         log(`  Search submitted: ${searchClicked}`)
 
-        // Wait for results to load
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {})
+        // Wait for results — ASNET is a SPA, so wait for AJAX/DOM changes, not page navigation
+        // Wait for navigation OR timeout (SPA won't navigate)
+        await Promise.race([
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {}),
+          new Promise(r => setTimeout(r, 8000)),
+        ])
         log(`  Results URL: ${page.url()}`)
 
-        // Additional wait for dynamic content
-        await page.waitForSelector('table tr td, .searchResult', { timeout: 10000 }).catch(() => {})
+        // Wait for results table to appear in DOM
+        await page.waitForSelector('table tr td', { timeout: 10000 }).catch(() => {})
+
+        // Log what's on the page now
+        const resultsInfo = await page.evaluate(() => ({
+          url: window.location.href,
+          bodySnippet: document.body.textContent.replace(/\s+/g, ' ').substring(0, 300),
+          tableRows: document.querySelectorAll('table tr').length,
+          hasLotNo: document.body.textContent.includes('Lot No') || document.body.textContent.includes('Lot No.'),
+        }))
+        log(`  Results: ${resultsInfo.tableRows} table rows, hasLotNo: ${resultsInfo.hasLotNo}`)
+        log(`  Content: ${resultsInfo.bodySnippet.substring(0, 200)}`)
 
         // Get total count — try both English and Japanese patterns
         const totalText = await page.evaluate(() => {
