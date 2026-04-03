@@ -82,80 +82,112 @@ async function main() {
   try {
     // ─── Step 1: Login ───────────────────────────────────────────────
     log('Logging into ASNET...')
-    await page.goto('https://www.asnet.jp/asnet/login', { waitUntil: 'networkidle2' })
+    await page.goto('https://www.asnet.jp/asnet/authentication/login', { waitUntil: 'networkidle2' })
 
-    // Take screenshot for debugging
-    await page.screenshot({ path: '/tmp/asnet-login.png' }).catch(() => {})
+    // Debug: log ALL input fields on the page
+    const allInputs = await page.evaluate(() => {
+      const inputs = document.querySelectorAll('input, textarea')
+      return Array.from(inputs).map(i => ({
+        tag: i.tagName,
+        type: i.type,
+        name: i.name,
+        id: i.id,
+        placeholder: i.placeholder,
+        className: i.className,
+      }))
+    })
+    log(`Found ${allInputs.length} inputs: ${JSON.stringify(allInputs)}`)
 
-    // Find and fill login form dynamically
-    const loginResult = await page.evaluate((user, pass) => {
-      // Find all text inputs and password inputs on the page
-      const textInputs = document.querySelectorAll('input[type="text"], input[type="tel"], input[type="number"], input:not([type])')
-      const passInputs = document.querySelectorAll('input[type="password"]')
+    // Fill login form — try every approach
+    const loginFilled = await page.evaluate((user, pass) => {
+      const allInputs = document.querySelectorAll('input')
+      let userFilled = false
+      let passFilled = false
 
-      if (textInputs.length === 0) return { error: 'No text inputs found on login page' }
-      if (passInputs.length === 0) return { error: 'No password inputs found on login page' }
+      const setValue = (input, value) => {
+        input.focus()
+        input.value = value
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        input.dispatchEvent(new Event('change', { bubbles: true }))
+        input.dispatchEvent(new Event('blur', { bubbles: true }))
+      }
 
-      // Log what we found for debugging
-      const inputInfo = []
-      textInputs.forEach(i => inputInfo.push(`text: name=${i.name} id=${i.id} type=${i.type}`))
-      passInputs.forEach(i => inputInfo.push(`pass: name=${i.name} id=${i.id}`))
+      for (const input of allInputs) {
+        const type = (input.type || '').toLowerCase()
+        const name = (input.name || '').toLowerCase()
+        const id = (input.id || '').toLowerCase()
+        const placeholder = (input.placeholder || '').toLowerCase()
 
-      // Fill the first text input with username, first password with password
-      const userInput = textInputs[0]
-      const passInput = passInputs[0]
+        // Password field
+        if (type === 'password' && !passFilled) {
+          setValue(input, pass)
+          passFilled = true
+          continue
+        }
 
-      // Use native setter to trigger React/Vue/jQuery handlers
-      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
-      nativeInputValueSetter.call(userInput, user)
-      userInput.dispatchEvent(new Event('input', { bubbles: true }))
-      userInput.dispatchEvent(new Event('change', { bubbles: true }))
-
-      nativeInputValueSetter.call(passInput, pass)
-      passInput.dispatchEvent(new Event('input', { bubbles: true }))
-      passInput.dispatchEvent(new Event('change', { bubbles: true }))
-
-      return { success: true, inputs: inputInfo }
-    }, ASNET_USER, ASNET_PASS)
-
-    if (loginResult.error) {
-      log(`Login form error: ${loginResult.error}`)
-      // Try alternate login URL
-      log('Trying alternate login URL...')
-      await page.goto('https://www.asnet.jp/', { waitUntil: 'networkidle2' })
-      await page.screenshot({ path: '/tmp/asnet-home.png' }).catch(() => {})
-    } else {
-      log(`Found inputs: ${loginResult.inputs?.join(', ')}`)
-    }
-
-    // Click submit/login button
-    await page.evaluate(() => {
-      const btns = document.querySelectorAll('input[type="submit"], button[type="submit"], button, a')
-      for (const btn of btns) {
-        const text = (btn.textContent || btn.value || '').toLowerCase()
-        if (text.includes('login') || text.includes('log in') || text.includes('ログイン') || text.includes('sign in')) {
-          btn.click()
-          return true
+        // Member number / user ID field — any non-password, non-hidden, non-submit input
+        if (!userFilled && type !== 'hidden' && type !== 'submit' && type !== 'button' && type !== 'checkbox' && type !== 'radio') {
+          setValue(input, user)
+          userFilled = true
+          continue
         }
       }
-      // Try submitting the form directly
+
+      return { userFilled, passFilled }
+    }, ASNET_USER, ASNET_PASS)
+
+    log(`Login form filled: user=${loginFilled.userFilled}, pass=${loginFilled.passFilled}`)
+
+    if (!loginFilled.userFilled || !loginFilled.passFilled) {
+      // Fallback: try using Puppeteer's type() on any visible input
+      log('Trying Puppeteer type() fallback...')
+      const inputs = await page.$$('input:not([type="hidden"]):not([type="submit"])')
+      if (inputs.length >= 2) {
+        await inputs[0].click({ clickCount: 3 }) // select all
+        await inputs[0].type(ASNET_USER, { delay: 30 })
+        await inputs[1].click({ clickCount: 3 })
+        await inputs[1].type(ASNET_PASS, { delay: 30 })
+        log('Typed via Puppeteer fallback')
+      } else if (inputs.length === 1) {
+        // Might only have password visible, user might be separate
+        await inputs[0].click({ clickCount: 3 })
+        await inputs[0].type(ASNET_USER, { delay: 30 })
+        log(`Only found ${inputs.length} visible input`)
+      }
+    }
+
+    // Click login/submit button
+    const loginClicked = await page.evaluate(() => {
+      const btns = document.querySelectorAll('button, input[type="submit"], a.btn, a')
+      for (const btn of btns) {
+        const text = (btn.textContent || btn.value || '').trim()
+        if (text.includes('ログイン') || text.includes('Login') || text.includes('login') || text.includes('Sign in')) {
+          btn.click()
+          return text
+        }
+      }
       const form = document.querySelector('form')
-      if (form) { form.submit(); return true }
-      return false
+      if (form) { form.submit(); return 'form.submit()' }
+      return null
     })
+    log(`Clicked: "${loginClicked}"`)
 
     await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {})
 
-    // Check if login succeeded
-    const pageUrl = page.url()
-    log(`Post-login URL: ${pageUrl}`)
-    if (pageUrl.includes('login')) {
-      log('Login may have failed — checking page content...')
-      const bodyText = await page.evaluate(() => document.body.textContent.substring(0, 500))
-      log(`Page content: ${bodyText.substring(0, 200)}`)
-      await page.screenshot({ path: '/tmp/asnet-after-login.png' }).catch(() => {})
+    const postLoginUrl = page.url()
+    log(`Post-login URL: ${postLoginUrl}`)
+
+    if (postLoginUrl.includes('login') || postLoginUrl.includes('authentication')) {
+      log('Login FAILED — still on login page. Check credentials.')
+      const errorText = await page.evaluate(() => {
+        const errors = document.querySelectorAll('.error, .alert, .message, [class*="error"], [class*="alert"]')
+        return Array.from(errors).map(e => e.textContent.trim()).join(' | ')
+      })
+      if (errorText) log(`Error messages: ${errorText}`)
+      await browser.close()
+      process.exit(1)
     }
-    log('Login step complete')
+    log('Login successful!')
 
     // Handle any post-login interstitial pages
     log('Handling post-login pages...')
