@@ -84,24 +84,78 @@ async function main() {
     log('Logging into ASNET...')
     await page.goto('https://www.asnet.jp/asnet/login', { waitUntil: 'networkidle2' })
 
-    // Fill login form
-    await page.type('input[name="userId"], input[name="user_id"], input[type="text"]', ASNET_USER, { delay: 50 })
-    await page.type('input[name="password"], input[type="password"]', ASNET_PASS, { delay: 50 })
+    // Take screenshot for debugging
+    await page.screenshot({ path: '/tmp/asnet-login.png' }).catch(() => {})
 
-    // Click login button
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle2' }),
-      page.click('input[type="submit"], button[type="submit"], .login_btn, #login_btn'),
-    ])
+    // Find and fill login form dynamically
+    const loginResult = await page.evaluate((user, pass) => {
+      // Find all text inputs and password inputs on the page
+      const textInputs = document.querySelectorAll('input[type="text"], input[type="tel"], input[type="number"], input:not([type])')
+      const passInputs = document.querySelectorAll('input[type="password"]')
+
+      if (textInputs.length === 0) return { error: 'No text inputs found on login page' }
+      if (passInputs.length === 0) return { error: 'No password inputs found on login page' }
+
+      // Log what we found for debugging
+      const inputInfo = []
+      textInputs.forEach(i => inputInfo.push(`text: name=${i.name} id=${i.id} type=${i.type}`))
+      passInputs.forEach(i => inputInfo.push(`pass: name=${i.name} id=${i.id}`))
+
+      // Fill the first text input with username, first password with password
+      const userInput = textInputs[0]
+      const passInput = passInputs[0]
+
+      // Use native setter to trigger React/Vue/jQuery handlers
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+      nativeInputValueSetter.call(userInput, user)
+      userInput.dispatchEvent(new Event('input', { bubbles: true }))
+      userInput.dispatchEvent(new Event('change', { bubbles: true }))
+
+      nativeInputValueSetter.call(passInput, pass)
+      passInput.dispatchEvent(new Event('input', { bubbles: true }))
+      passInput.dispatchEvent(new Event('change', { bubbles: true }))
+
+      return { success: true, inputs: inputInfo }
+    }, ASNET_USER, ASNET_PASS)
+
+    if (loginResult.error) {
+      log(`Login form error: ${loginResult.error}`)
+      // Try alternate login URL
+      log('Trying alternate login URL...')
+      await page.goto('https://www.asnet.jp/', { waitUntil: 'networkidle2' })
+      await page.screenshot({ path: '/tmp/asnet-home.png' }).catch(() => {})
+    } else {
+      log(`Found inputs: ${loginResult.inputs?.join(', ')}`)
+    }
+
+    // Click submit/login button
+    await page.evaluate(() => {
+      const btns = document.querySelectorAll('input[type="submit"], button[type="submit"], button, a')
+      for (const btn of btns) {
+        const text = (btn.textContent || btn.value || '').toLowerCase()
+        if (text.includes('login') || text.includes('log in') || text.includes('ログイン') || text.includes('sign in')) {
+          btn.click()
+          return true
+        }
+      }
+      // Try submitting the form directly
+      const form = document.querySelector('form')
+      if (form) { form.submit(); return true }
+      return false
+    })
+
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {})
 
     // Check if login succeeded
     const pageUrl = page.url()
+    log(`Post-login URL: ${pageUrl}`)
     if (pageUrl.includes('login')) {
-      log('Login failed — check credentials')
-      await browser.close()
-      process.exit(1)
+      log('Login may have failed — checking page content...')
+      const bodyText = await page.evaluate(() => document.body.textContent.substring(0, 500))
+      log(`Page content: ${bodyText.substring(0, 200)}`)
+      await page.screenshot({ path: '/tmp/asnet-after-login.png' }).catch(() => {})
     }
-    log('Login successful!')
+    log('Login step complete')
 
     // ─── Step 2: Scrape each make ────────────────────────────────────
     let grandTotal = 0
