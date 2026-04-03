@@ -157,6 +157,26 @@ async function main() {
     }
     log('Login step complete')
 
+    // Handle any post-login interstitial pages (popups, agreements, landing pages)
+    await page.evaluate(() => {
+      // Click through any "proceed" or "agree" buttons
+      const btns = document.querySelectorAll('a, button, input[type="submit"]')
+      for (const btn of btns) {
+        const text = (btn.textContent || btn.value || '').trim()
+        if (text.includes('進む') || text.includes('Proceed') || text.includes('OK') || text.includes('同意') || text.includes('Agree')) {
+          btn.click()
+          return true
+        }
+      }
+      return false
+    })
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {})
+
+    // Navigate directly to the Direct Search page
+    log('Navigating to Direct Search...')
+    await page.goto('https://www.asnet.jp/asnet/search/ippatsusearchlist', { waitUntil: 'networkidle2', timeout: 30000 })
+    log(`Search page URL: ${page.url()}`)
+
     // ─── Step 2: Scrape each make ────────────────────────────────────
     let grandTotal = 0
 
@@ -168,8 +188,27 @@ async function main() {
         // Navigate to Direct Search
         await page.goto('https://www.asnet.jp/asnet/search/ippatsusearchlist', {
           waitUntil: 'networkidle2',
+          timeout: 30000,
         })
-        await page.waitForSelector('select', { timeout: 10000 })
+
+        // Wait for page to be ready — look for select or any form element
+        await page.waitForSelector('select, form, input', { timeout: 15000 }).catch(() => {})
+
+        // Log what we see for debugging
+        const pageInfo = await page.evaluate(() => ({
+          url: window.location.href,
+          title: document.title,
+          selectCount: document.querySelectorAll('select').length,
+          formCount: document.querySelectorAll('form').length,
+          bodySnippet: document.body?.textContent?.substring(0, 200),
+        }))
+        log(`  Page: ${pageInfo.url} | ${pageInfo.selectCount} selects, ${pageInfo.formCount} forms`)
+
+        if (pageInfo.selectCount === 0) {
+          log(`  No select dropdowns found, page may not have loaded. Skipping ${make}`)
+          log(`  Body: ${pageInfo.bodySnippet}`)
+          continue
+        }
 
         // Select the make from the dropdown
         const selected = await page.evaluate((makeName) => {
