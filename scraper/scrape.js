@@ -6,6 +6,7 @@ const ASNET_USER = process.env.ASNET_USERNAME
 const ASNET_PASS = process.env.ASNET_PASSWORD
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY
+const STORAGE_BUCKET = 'vehicle-images'
 
 // Make names in both English and Japanese for matching
 const MAKES = [
@@ -85,13 +86,63 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms))
 }
 
-// ─── Main scraper ────────────────────────────────────────────────────────────
+// ─── Supabase Storage helpers ──────────────────���────────────────────────────
+async function ensureStorageBucket() {
+  const { data: buckets, error: listErr } = await supabase.storage.listBuckets()
+  if (listErr) {
+    log(`Cannot list buckets (expected with anon key). Assuming bucket exists.`)
+    return
+  }
+  const exists = buckets?.some(b => b.name === STORAGE_BUCKET)
+  if (!exists) {
+    const { error } = await supabase.storage.createBucket(STORAGE_BUCKET, {
+      public: true,
+      fileSizeLimit: 10485760,
+    })
+    if (error && !error.message?.includes('already exists')) {
+      log(`Warning: could not create bucket "${STORAGE_BUCKET}": ${error.message}`)
+      log(`  Ensure the bucket exists in Supabase Dashboard > Storage`)
+    } else {
+      log(`Created storage bucket: ${STORAGE_BUCKET}`)
+    }
+  } else {
+    log(`Storage bucket "${STORAGE_BUCKET}" already exists`)
+  }
+}
+
+async function uploadToSupabase(buffer, stockNumber, index, subfolder) {
+  try {
+    if (buffer.length < 100) return null
+    let mimeType = 'image/jpeg', ext = 'jpg'
+    if (buffer[0] === 0x89 && buffer[1] === 0x50) { mimeType = 'image/png'; ext = 'png' }
+    else if (buffer[0] === 0x47 && buffer[1] === 0x49) { mimeType = 'image/gif'; ext = 'gif' }
+
+    const safeName = stockNumber.replace(/[^a-zA-Z0-9_-]/g, '_')
+    const filePath = `${subfolder}/${safeName}/${index}.${ext}`
+
+    const { error } = await supabase.storage
+      .from(STORAGE_BUCKET)
+      .upload(filePath, buffer, { contentType: mimeType, upsert: true })
+
+    if (error) {
+      log(`    Upload error for ${filePath}: ${error.message}`)
+      return null
+    }
+    const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(filePath)
+    return urlData?.publicUrl || null
+  } catch {
+    return null
+  }
+}
+
+// ─── Main scraper ─────────���──────────────────────��───────────────────────────
 async function main() {
-  log('Starting ASNET scraper v11...')
+  log('Starting ASNET scraper v12 (Supabase image upload)...')
   log('Mode: FULL (all pages, year-range splitting for high-volume makes)')
 
   const browser = await puppeteer.launch({
     headless: 'new',
+    protocolTimeout: 60000,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -222,6 +273,9 @@ async function main() {
       process.exit(1)
     }
     log('Login successful!')
+
+    // Ensure Supabase Storage bucket exists
+    await ensureStorageBucket()
 
     // Handle any post-login interstitial pages
     // Switch to English mode
@@ -708,69 +762,85 @@ async function scrapeMakeRange(page, make, yearRange) {
   return makeTotal
 }
 
-// ─── Image enrichment — click detail popups and capture AJAX image URLs ──────
-// Uses page.evaluate click (not native .click()) to avoid protocolTimeout in headless.
-// Uses page.on('response') event listener pattern which is proven reliable.
+// ─── Image enrichment — capture response bytes and upload to Supabase Storage ─
+// Intercepts actual image HTTP responses (not just URLs) from the detail popup,
+// uploads them to Supabase Storage, and stores the public URLs in the DB.
+// This avoids session-protected imga.asnet2.com URLs that don't work publicly.
 async function enrichPageWithImages(page, uniqueRecords, pageNum) {
-  const detailLinkCount = (await page.$$('a.showDetail')).length
+  const detailLinkCount = await page.evaluate(() => document.querySelectorAll('a.showDetail').length)
   if (!detailLinkCount) return
 
   let enrichedCount = 0
 
   for (let d = 0; d < detailLinkCount && d < uniqueRecords.length; d++) {
     try {
-      // Set up AJAX response capture BEFORE clicking
-      let ajaxHtml = null
-      const handler = async (response) => {
-        if (response.url().includes('/detail')) {
-          ajaxHtml = await response.text().catch(() => null)
+      // Capture image response buffers as they load in the detail popup
+      const capturedImages = []
+      let detailHtmlReceived = false
+
+      const responseHandler = async (response) => {
+        const url = response.url()
+        if (url.includes('/detail')) detailHtmlReceived = true
+        if (url.includes('imga.asnet2.com/ImgGet')) {
+          try {
+            const buffer = await response.buffer()
+            if (buffer && buffer.length > 500) {
+              capturedImages.push({ buffer, isSheet: /v5=1\d{2}/.test(url) })
+            }
+          } catch {}
         }
       }
-      page.on('response', handler)
+      page.on('response', responseHandler)
 
-      // Click via page.evaluate (JS-level click — returns instantly in headless)
-      // Native Puppeteer .click() hangs in headless due to scroll/mouse protocol overhead
+      // Click via page.evaluate (JS-level click — avoids protocolTimeout in headless)
       await page.evaluate((idx) => {
         const links = document.querySelectorAll('a.showDetail')
         if (links[idx]) links[idx].click()
       }, d)
 
-      // Wait for the AJAX response (8s matches the proven test-images.js pattern)
-      await sleep(8000)
-
-      page.off('response', handler)
-
-      // Fallback: if event listener missed AJAX, try scraping popup DOM directly
-      if (!ajaxHtml) {
-        ajaxHtml = await page.evaluate(() => {
-          const dialog = document.querySelector('.ui-dialog-content')
-          return dialog ? dialog.innerHTML : null
-        }).catch(() => null)
+      // Wait for detail HTML + images to load
+      let waited = 0
+      while (!detailHtmlReceived && waited < 10000) {
+        await sleep(500)
+        waited += 500
       }
+      await sleep(4000) // Extra time for image responses
 
-      if (ajaxHtml) {
-        // Decode HTML entities (&amp; -> &) before parsing URLs
-        const decodedHtml = ajaxHtml.replace(/&amp;/g, '&')
-        // Parse image URLs from the AJAX/popup HTML
-        const allImgUrls = [...new Set(
-          [...decodedHtml.matchAll(/(https?:\/\/imga\.asnet2\.com\/ImgGet[^"'\s<>]+)/gi)].map(m => m[1])
-        )]
+      page.off('response', responseHandler)
 
-        if (allImgUrls.length > 0) {
-          // Photos: URLs without v5=1XX pattern (main vehicle photos)
-          const photos = allImgUrls.filter(u => !u.match(/v5=1\d{2}/))
-          // Sheets: URLs with v5=1XX pattern (auction sheet scans)
-          const sheets = allImgUrls.filter(u => u.match(/v5=1\d{2}/))
+      const stockNum = uniqueRecords[d].stock_number
+      const photos = capturedImages.filter(i => !i.isSheet)
+      const sheets = capturedImages.filter(i => i.isSheet)
 
-          const updateData = { images: photos.length > 0 ? photos : allImgUrls }
-          if (sheets.length > 0) updateData.auction_sheet_url = sheets[0]
+      if (capturedImages.length > 0) {
+        log(`    [${d + 1}/${detailLinkCount}] ${stockNum}: captured ${photos.length} photos, ${sheets.length} sheets`)
 
-          await supabase.from('auction_vehicles').update(updateData).eq('stock_number', uniqueRecords[d].stock_number)
+        // Upload photos to Supabase Storage
+        const photoUrls = []
+        for (let i = 0; i < photos.length; i++) {
+          const publicUrl = await uploadToSupabase(photos[i].buffer, stockNum, i, 'photos')
+          if (publicUrl) photoUrls.push(publicUrl)
+        }
+
+        // Upload first auction sheet
+        let sheetUrl = null
+        if (sheets.length > 0) {
+          sheetUrl = await uploadToSupabase(sheets[0].buffer, stockNum, 0, 'sheets')
+        }
+
+        log(`    [${d + 1}/${detailLinkCount}] Uploaded ${photoUrls.length} photos${sheetUrl ? ' + sheet' : ''}`)
+
+        const updateData = {}
+        if (photoUrls.length > 0) updateData.images = photoUrls
+        if (sheetUrl) updateData.auction_sheet_url = sheetUrl
+
+        if (Object.keys(updateData).length > 0) {
+          await supabase.from('auction_vehicles').update(updateData).eq('stock_number', stockNum)
           enrichedCount++
         }
       }
 
-      // Close popup — Escape key + force DOM cleanup (most reliable in headless)
+      // Close popup — Escape key + force DOM cleanup
       await page.keyboard.press('Escape').catch(() => {})
       await sleep(300)
       await page.evaluate(() => {
@@ -779,7 +849,7 @@ async function enrichPageWithImages(page, uniqueRecords, pageNum) {
       await sleep(500)
 
     } catch (e) {
-      // Non-critical enrichment error — close any leftover popup and continue
+      log(`    [${d + 1}/${detailLinkCount}] Enrichment error: ${e.message}`)
       await page.keyboard.press('Escape').catch(() => {})
       await page.evaluate(() => {
         document.querySelectorAll('.ui-dialog, .ui-widget-overlay').forEach(el => el.remove())
@@ -790,7 +860,7 @@ async function enrichPageWithImages(page, uniqueRecords, pageNum) {
     if ((d + 1) % 10 === 0) log(`    Enriched ${d + 1}/${detailLinkCount} (${enrichedCount} with images)...`)
   }
 
-  log(`  Page ${pageNum}: enriched ${enrichedCount}/${detailLinkCount} with full images + auction sheets`)
+  log(`  Page ${pageNum}: enriched ${enrichedCount}/${detailLinkCount} with images uploaded to Supabase Storage`)
 }
 
 main()
